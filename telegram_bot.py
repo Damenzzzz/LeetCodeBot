@@ -183,9 +183,9 @@ def leetcode_recent_submissions(nick: str, limit: int = 20):
 def solved_on_date(nick: str, target_date) -> tuple[bool | None, str | None]:
     """
     Returns (solved, err):
-      - solved=True  if there is at least 1 Accepted submission on target_date
-      - solved=False if no Accepted submission on target_date
-      - solved=None  if request failed (err is filled)
+    - solved=True  if there is at least 1 Accepted submission on target_date
+    - solved=False if no Accepted submission on target_date
+    - solved=None  if request failed (err is filled)
     """
     try:
         subs = leetcode_recent_submissions(nick)
