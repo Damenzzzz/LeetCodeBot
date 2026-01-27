@@ -74,7 +74,6 @@ def init_db():
         )
         """
     )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS config (
@@ -564,8 +563,6 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     header = f"🧾 Итог дня — {today_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await context.bot.send_message(chat_id=chat_id, text=text)
-
-
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
