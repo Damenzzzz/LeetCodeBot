@@ -566,13 +566,13 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "ℹ️ *Информация о боте*\n\n"
+        "?????? *Информация о боте*\n\n"
         "Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n"
         "*Как начать:*\n"
-        "1️⃣ Добавь бота в группу\n"
-        "2️⃣ Сделай бота администратором\n"
-        "3️⃣ В группе напиши /setgroup\n"
-        "4️⃣ Каждый участник пишет /register <leetcode_nick>\n\n"
+        "1. Добавь бота в группу\n"
+        "2. Сделай бота администратором\n"
+        "3. В группе напиши /setgroup\n"
+        "4. Каждый участник пишет /register <leetcode_nick>\n\n"
         "*Команды:*\n"
         "• /register <nick> — зарегистрировать LeetCode ник\n"
         "• /unregister — удалить себя из бота\n"
