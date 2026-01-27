@@ -10,6 +10,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 - /check                      — ДЛЯ ВСЕХ: показывает твои задачи за сегодня (сколько и какие)
 - /week                       — статистика за последние 7 дней (итоги по каждому)
 - /week @user                 — статистика за 7 дней для конкретного пользователя
+- /backup                     — (админ) прислать файл базы (регистрации/статистика) для переноса
 
 Авто-уведомления:
 - каждые 3 часа: пингует тех, кто сегодня ещё не решил ни 1 задачу (с упоминаниями)
@@ -43,6 +44,7 @@ from telegram.ext import (
 
 # ----------------- Config -----------------
 DB_PATH = "leetcode_bot.db"
+DB_SCHEMA_VERSION = 1
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 
@@ -51,6 +53,8 @@ DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "59"))
 
 REMINDER_INTERVAL_SECONDS = 3 * 60 * 60  # 3 hours
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
+
+ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -74,6 +78,7 @@ def init_db():
         )
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS config (
@@ -99,6 +104,35 @@ def init_db():
     conn.commit()
     conn.close()
 
+    ensure_db_schema()
+
+
+
+def ensure_db_schema():
+    """
+    Simple schema-versioning for SQLite.
+    Stores current version in config key 'db_schema_version'.
+    This allows safe future changes (add tables/columns) without losing user data.
+    """
+    target = DB_SCHEMA_VERSION
+    current_raw = db_get_config("db_schema_version")
+    try:
+        current = int(current_raw) if current_raw is not None else 0
+    except Exception:
+        current = 0
+
+    if current >= target:
+        return
+
+    # --- Migrations ---
+    # v1: initial schema (users/config/daily_stats)
+    # Tables are created with CREATE TABLE IF NOT EXISTS, so we only need to record the version.
+    if current < 1:
+        db_set_config("db_schema_version", "1")
+        current = 1
+
+    # If you add new migrations later, extend like:
+    # if current < 2: ...; db_set_config("db_schema_version","2"); current=2
 
 def db_set_config(key: str, value: str):
     conn = sqlite3.connect(DB_PATH)
@@ -255,6 +289,57 @@ def mention(uname: str) -> str:
         return f"@{uname}"
     return uname or "unknown"
 
+
+async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """
+    Admin check:
+    - If env ADMIN_IDS is set (comma-separated user IDs), only those users can use admin commands anywhere.
+    - Otherwise: in groups, chat admins/owners can use; in private chats -> deny (ask to set ADMIN_IDS).
+    """
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if ADMIN_IDS:
+        return user and user.id in ADMIN_IDS
+
+    if chat and chat.type in ("group", "supergroup"):
+        try:
+            member = await chat.get_member(user.id)
+            return member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER)
+        except Exception:
+            return False
+
+    # private / unknown chat: require ADMIN_IDS for safety
+    return False
+
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /backup — admin-only: sends the SQLite DB file to the admin as a document.
+    Useful before moving to VPS (Oracle) or after redeploys on ephemeral storage.
+    """
+    if not await _is_admin(update, context):
+        await update.message.reply_text(
+            "⛔ Эта команда только для админа.\n"
+            "Если хочешь включить админ-доступ в личке — задай переменную ADMIN_IDS (id через запятую)."
+        )
+        return
+
+    db_path = DB_PATH
+    if not os.path.exists(db_path):
+        await update.message.reply_text(f"База не найдена по пути: {db_path}")
+        return
+
+    # A tiny “fun” message
+    await update.message.reply_text("🧳 Пакую базу в чемодан… ща прилетит 📦")
+
+    try:
+        with open(db_path, "rb") as f:
+            filename = os.path.basename(db_path)
+            await update.message.reply_document(document=f, filename=filename, caption="✅ Вот бэкап базы. Не теряй 😄")
+    except Exception as e:
+        logger.exception("Backup send failed: %s", e)
+        await update.message.reply_text(f"⚠️ Не смог отправить файл базы: {e}")
 
 # ----------------- Telegram handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -565,15 +650,11 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1. Добавь бота в группу\n 2️⃣ Сделай бота администратором\n 3️⃣ В группе напиши /setgroup\n 4️⃣ Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣ Добавь бота в группу\n 2️⃣ Сделай бота администратором\n 3️⃣ В группе напиши /setgroup\n 4️⃣ Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
-        await update.message.reply_text(text)  # без форматирования
-
-    # await update.message.reply_text(
-    #     parse_mode="Markdown"
-    # )
+        await update.message.reply_text(text)
 
 
 # ----------------- Main -----------------
@@ -594,6 +675,7 @@ def main():
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("info", info))
+    app.add_handler(CommandHandler("backup", backup))
 
     # Every 3 hours reminder
     app.job_queue.run_repeating(reminder_job, interval=REMINDER_INTERVAL_SECONDS, first=10)
