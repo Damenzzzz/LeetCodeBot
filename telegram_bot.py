@@ -43,18 +43,19 @@ from telegram.ext import (
 )
 
 # ----------------- Config -----------------
-DB_PATH = "leetcode_bot.db"
+DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DB_SCHEMA_VERSION = 1
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 
-DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
-DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "59"))
+DAILY_HOUR = int(os.getenv("DAILY_HOUR", "22"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "00"))
 
 REMINDER_INTERVAL_SECONDS = 3 * 60 * 60  # 3 hours
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
+OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # your personal Telegram user_id; set in Railway Variables
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -290,6 +291,34 @@ def mention(uname: str) -> str:
     return uname or "unknown"
 
 
+def _now_str() -> str:
+    return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+
+
+async def maybe_set_group_chat(update: Update):
+    """
+    Надёжность для Railway Trial:
+    - Если бот получает любую команду в группе/супергруппе, запоминаем chat_id как report_chat_id.
+    Это нужно, потому что на Railway Trial БД может очищаться после деплоя и /setgroup забывается.
+    """
+    try:
+        chat = update.effective_chat
+        if chat and chat.type in ("group", "supergroup"):
+            cur = db_get_config("report_chat_id")
+            if cur != str(chat.id):
+                db_set_config("report_chat_id", str(chat.id))
+                logger.info("Auto-set report_chat_id=%s at %s", chat.id, _now_str())
+    except Exception as e:
+        logger.warning("maybe_set_group_chat failed: %s", e)
+
+
+def _get_last_report_day() -> Optional[str]:
+    return db_get_config("last_daily_report_day")
+
+
+def _set_last_report_day(day_str: str):
+    db_set_config("last_daily_report_day", day_str)
+
 async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """
     Admin check:
@@ -314,6 +343,7 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     """
     /backup — admin-only: sends the SQLite DB file to the admin as a document.
     Useful before moving to VPS (Oracle) or after redeploys on ephemeral storage.
@@ -341,8 +371,148 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Backup send failed: %s", e)
         await update.message.reply_text(f"⚠️ Не смог отправить файл базы: {e}")
 
+
+
+async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /restore — hidden owner-only:
+    Send JSON backup file and reply to it with /restore.
+    Not advertised in /start or /info.
+    """
+    user = update.effective_user
+    if not user or not OWNER_ID or user.id != OWNER_ID:
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    msg = update.message
+    doc = None
+    if msg and msg.document:
+        doc = msg.document
+    elif msg and msg.reply_to_message and msg.reply_to_message.document:
+        doc = msg.reply_to_message.document
+
+    if not doc:
+        await update.message.reply_text(
+            "Пришли JSON-бэкап файлом и ответь на него командой /restore."
+            "Пример: отправляешь backup.json → reply → /restore"
+        )
+        return
+
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await update.message.reply_text("Нужен .json файл бэкапа.")
+        return
+
+    await update.message.reply_text("🧩 Ок, распаковываю бэкап… (не дыши)")
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        raw = await tg_file.download_as_bytearray()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        logger.exception("Restore read/parse failed: %s", e)
+        await update.message.reply_text(f"⚠️ Не смог прочитать/распарсить JSON: {e}")
+        return
+
+    schema_version = data.get("schema_version") or data.get("db_schema_version") or 1
+    try:
+        schema_version = int(schema_version)
+    except Exception:
+        schema_version = 1
+
+    users_rows = data.get("users")
+    stats_rows = data.get("daily_stats")
+    config_rows = data.get("config")
+
+    if isinstance(data.get("tables"), dict):
+        t = data["tables"]
+        users_rows = users_rows or t.get("users")
+        stats_rows = stats_rows or t.get("daily_stats")
+        config_rows = config_rows or t.get("config")
+
+    if users_rows is None and stats_rows is None and config_rows is None:
+        await update.message.reply_text("⚠️ Это не похоже на бэкап (нет users/daily_stats/config).")
+        return
+
+    try:
+        # Make sure schema exists
+        init_db()
+
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+
+        # Clear existing data
+        cur.execute("DELETE FROM users")
+        cur.execute("DELETE FROM daily_stats")
+        cur.execute("DELETE FROM config")
+
+        # Restore config
+        if config_rows:
+            if isinstance(config_rows, dict):
+                for k, v in config_rows.items():
+                    cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", (str(k), str(v)))
+            else:
+                for row in config_rows:
+                    k = row.get("key")
+                    v = row.get("value")
+                    if k is not None and v is not None:
+                        cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", (str(k), str(v)))
+
+        # Record schema version
+        cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", ("db_schema_version", str(schema_version)))
+
+        # Restore users
+        users_count = 0
+        if users_rows:
+            for row in users_rows:
+                tid = row.get("telegram_id") or row.get("tid") or row.get("id")
+                uname = row.get("username") or row.get("uname") or ""
+                nick = row.get("leetcode_nick") or row.get("nick") or row.get("leetcode") or ""
+                if tid is None or not nick:
+                    continue
+                cur.execute(
+                    "REPLACE INTO users(telegram_id, username, leetcode_nick) VALUES(?,?,?)",
+                    (int(tid), str(uname), str(nick)),
+                )
+                users_count += 1
+
+        # Restore daily_stats
+        stats_count = 0
+        if stats_rows:
+            for row in stats_rows:
+                day = row.get("day")
+                tid = row.get("telegram_id") or row.get("tid")
+                cnt = row.get("solved_count") or row.get("count") or 0
+                titles_json = row.get("titles_json")
+                titles = row.get("titles")
+                if titles_json is None and titles is not None:
+                    titles_json = json.dumps(titles, ensure_ascii=False)
+                if day is None or tid is None:
+                    continue
+                cur.execute(
+                    "REPLACE INTO daily_stats(day, telegram_id, solved_count, titles_json) VALUES(?,?,?,?)",
+                    (str(day), int(tid), int(cnt), titles_json or "[]"),
+                )
+                stats_count += 1
+
+        conn.commit()
+        conn.close()
+
+        _cache.clear()
+
+        await update.message.reply_text(
+            "✅ Восстановление завершено!"
+            f"• users: {users_count}"
+            f"• daily_stats: {stats_count}"
+            "Можно продолжать: /list, /week."
+        )
+    except Exception as e:
+        logger.exception("Restore failed: %s", e)
+        await update.message.reply_text(f"❌ Restore упал: {e}")
+
+
 # ----------------- Telegram handlers -----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     await update.message.reply_text(
         "🤖 Yo! Я LeetCode-бот.\n\n"
         "Команды:\n"
@@ -352,27 +522,51 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /list — статус всех сегодня\n"
         "• /list @user — задачи пользователя сегодня\n"
         "• /week — статистика за 7 дней\n"
-        "• /setgroup — (админ) куда слать напоминания\n\n"
+        "• /setgroup — (админ) куда слать напоминания\n"
+        "• /info — полная информация по боту и командам\n\n"
         "Правило простое: минимум 1 задача в день ✅"
     )
 
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     user = update.effective_user
     if len(context.args) != 1:
         await update.message.reply_text("Использование: /register <leetcode_nick>")
         return
     nick = context.args[0].strip()
     add_user(user.id, user.username or user.full_name, nick)
-    await update.message.reply_text(f"🔥 Готово! Ты зарегистрирован как: {nick}")
+
+    # сброс кеша на сегодня для нового ника, чтобы /list сразу показал актуально
+    today_key = datetime.now(TZ).strftime("%Y-%m-%d")
+    _cache.pop((nick, today_key), None)
+
+    # небольшая проверка: сколько уже решено сегодня
+    titles, err = accepted_titles_today(nick)
+    if err:
+        await update.message.reply_text(
+            f"🔥 Готово! Ты зарегистрирован как: {nick}"
+            "⚠️ Но LeetCode сейчас не ответил — позже /check покажет всё нормально."
+        )
+        return
+
+    cnt = len(titles or [])
+    mark = "✅" if cnt >= 1 else "❌"
+    await update.message.reply_text(
+        f"🔥 Готово! Ты зарегистрирован как: {nick}"
+        f"Сегодня у тебя: {cnt} задач {mark}"
+        "Теперь ты в общем списке /list (если вдруг не видно — сделай /list ещё раз через 5–10 сек, Telegram иногда доставляет апдейты пачкой 😄)"
+    )
 
 
 async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     remove_user(update.effective_user.id)
     await update.message.reply_text("🫡 Удалил. Но я верю, ты вернёшься сильнее.")
 
 
 async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     chat = update.effective_chat
     user = update.effective_user
     if chat.type not in ("group", "supergroup"):
@@ -389,6 +583,7 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     """
     /check — персонально: сколько задач ты решил сегодня и какие.
     """
@@ -425,6 +620,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     """
     /list — ДЛЯ ВСЕХ: статус всех сегодня (кол-во задач + ✅/❌)
     /list @user — ДЛЯ ВСЕХ: задачи пользователя сегодня
@@ -472,20 +668,29 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # /list - summary
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
-    lines = []
+
+    scored = []  # (cnt, name, line, had_error)
     for _, uname, nick in rows:
         titles, err = accepted_titles_today(nick)
         if err:
-            lines.append(f"{mention(uname)} — ❓ ошибка проверки")
+            name = mention(uname)
+            scored.append((-1, name, f"{name} — ❓ ошибка проверки", True))
             continue
+
         cnt = len(titles or [])
         mark = "✅" if cnt >= 1 else "❌"
-        lines.append(f"{mention(uname)} — {cnt} задач {mark}")
+        name = mention(uname)
+        scored.append((cnt, name, f"{name} — {cnt} задач {mark}", False))
 
+    # Sort: more solved -> top; zeros -> bottom; errors -> very bottom
+    scored.sort(key=lambda x: (x[3], -x[0], x[1].lower()))
+
+    lines = [line for _, __, line, ___ in scored]
     await update.message.reply_text(header + "\n" + "\n".join(lines))
 
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
     """
     /week — 7-day totals for everyone (from stored daily snapshots)
     /week @user — 7-day breakdown for one user
@@ -547,21 +752,24 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(msg_lines))
 
-
+    
 # ----------------- Jobs: reminder + daily report -----------------
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("Reminder tick at %s", _now_str())
     """
     Every 3 hours:
     - ping those who have 0 accepted today (with mentions)
     - if everyone has >=1, send celebration once per day
     """
-    chat_id = db_get_config("report_chat_id")
-    if not chat_id:
+    chat_id_raw = db_get_config("report_chat_id")
+    if not chat_id_raw:
+        logger.info("Reminder skipped: report_chat_id not set")
         return
-    chat_id = int(chat_id)
+    chat_id = int(chat_id_raw)
 
     rows = list_users()
     if not rows:
+        logger.info("Reminder skipped: no users registered")
         return
 
     today = datetime.now(TZ).date()
@@ -582,8 +790,8 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "🎉 ВСЕ МОЛОДЦЫ!\n\n"
-                    "Каждый решил минимум 1 задачу сегодня 💪🔥\n"
+                    "🎉 ВСЕ МОЛОДЦЫ!"
+                    "Каждый решил минимум 1 задачу сегодня 💪🔥"
                     "Группа официально НЕ ленивая 😎"
                 ),
             )
@@ -595,16 +803,20 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     e = emojis[int(datetime.now(TZ).timestamp()) % len(emojis)]
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"{e} Напоминалка: сегодня ещё без задач:\n" + ", ".join(not_done) + "\n\n"
-            "Правило простое: минимум 1 задача. Погнали! 🚀"
+        text=(
+            f"{e} Напоминалка: сегодня ещё без задач:"
+            + ", ".join(not_done)
+            + "Правило простое: минимум 1 задача. Погнали! 🚀"
+        ),
     )
 
 
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
+async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optional[date] = None):
     """
     End-of-day report:
     - saves today's counts to daily_stats
     - posts status list + MVP day
+    - target by the value of target_day (for catch-up job); otherwise uses today
     """
     chat_id = db_get_config("report_chat_id")
     if not chat_id:
@@ -616,17 +828,17 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(chat_id=chat_id, text="Сегодня никого не было в списке 😄")
         return
 
-    today = datetime.now(TZ).date()
-    today_str = today.strftime("%Y-%m-%d")
+    day = target_day or datetime.now(TZ).date()
+    day_str = day.strftime("%Y-%m-%d")
 
     report_lines = []
     mvp = ("", -1)  # (uname, count)
 
     for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, today)
+        titles, err = accepted_titles_on_day(nick, day)
         if err:
             report_lines.append(f"{mention(uname)} — ❓ ошибка проверки")
-            save_daily_stats(today_str, int(tid), 0, [])
+            save_daily_stats(day_str, int(tid), 0, [])
             continue
 
         titles = titles or []
@@ -634,7 +846,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         mark = "✅" if cnt >= 1 else "❌"
         report_lines.append(f"{mention(uname)} — {cnt} задач {mark}")
 
-        save_daily_stats(today_str, int(tid), cnt, titles)
+        save_daily_stats(day_str, int(tid), cnt, titles)
 
         if cnt > mvp[1]:
             mvp = (mention(uname), cnt)
@@ -645,16 +857,37 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     else:
         mvp_line = f"🏆 MVP дня: {mvp[0]} — {mvp[1]} задач(и) 🔥"
 
-    header = f"🧾 Итог дня — {today_str}\n(цель: ≥1 задача)\n"
+    header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await context.bot.send_message(chat_id=chat_id, text=text)
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣ Добавь бота в группу\n 2️⃣ Сделай бота администратором\n 3️⃣ В группе напиши /setgroup\n 4️⃣ Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    await maybe_set_group_chat(update)
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
-        await update.message.reply_text(text)
+        await update.message.reply_text(text);
+
+
+
+async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Run once after startup:
+    if yesterday's daily report was missed, generate it now.
+    """
+    try:
+        last_day = _get_last_report_day()
+        y = datetime.now(TZ).date() - timedelta(days=1)
+        y_str = y.strftime("%Y-%m-%d")
+        if last_day == y_str:
+            return
+        if not db_get_config("report_chat_id"):
+            return
+        logger.info("Catch-up job: generating report for %s at %s", y_str, _now_str())
+        await daily_report_job(context, target_day=y)
+    except Exception as e:
+        logger.exception("catchup_job failed: %s", e)
 
 
 # ----------------- Main -----------------
@@ -676,8 +909,8 @@ def main():
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("backup", backup))
+    app.add_handler(CommandHandler("restore", restore))  # hidden owner-only
 
-    # Every 3 hours reminder
     app.job_queue.run_repeating(reminder_job, interval=REMINDER_INTERVAL_SECONDS, first=10)
 
     # End-of-day report (and stats snapshot)
@@ -686,8 +919,12 @@ def main():
         time=time(hour=DAILY_HOUR, minute=DAILY_MINUTE, tzinfo=TZ),
     )
 
+    # Catch-up once shortly after start (если бот был оффлайн в момент отчёта)
+    app.job_queue.run_once(catchup_job, when=30)
+
     print("Bot started. Press Ctrl-C to stop.")
     app.run_polling()
+
 
 
 if __name__ == "__main__":
