@@ -218,13 +218,46 @@ def nick_escape(s: str) -> str:
 
 def leetcode_recent_submissions(nick: str):
     q = (
-        '{ recentSubmissionList(username: "%s") { title timestamp statusDisplay } }'
+        '{ recentSubmissionList(username: "%s") { title titleSlug timestamp statusDisplay } }'
         % nick_escape(nick)
     )
     resp = requests.post(LEETCODE_GRAPHQL, json={"query": q}, timeout=15)
     resp.raise_for_status()
     data = resp.json()
     return data.get("data", {}).get("recentSubmissionList") or []
+
+
+
+# difficulty cache: titleSlug -> (DIFFICULTY, fetched_at_epoch)
+_diff_cache: Dict[str, Tuple[str, float]] = {}
+_DIFF_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h
+
+
+def leetcode_question_difficulty(title_slug: Optional[str]) -> str:
+    """Return difficulty for a LeetCode problem by titleSlug (EASY/MEDIUM/HARD)."""
+    if not title_slug:
+        return "UNKNOWN"
+
+    now_ts = datetime.now(TZ).timestamp()
+    cached = _diff_cache.get(title_slug)
+    if cached and (now_ts - cached[1] < _DIFF_CACHE_TTL_SECONDS):
+        return cached[0]
+
+    q = '{ question(titleSlug: "%s") { difficulty } }' % nick_escape(title_slug)
+    try:
+        resp = requests.post(LEETCODE_GRAPHQL, json={"query": q}, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        diff = (data.get("data", {}).get("question", {}) or {}).get("difficulty") or "UNKNOWN"
+    except Exception as e:
+        logger.exception("LeetCode difficulty fetch error for %s: %s", title_slug, e)
+        diff = "UNKNOWN"
+
+    diff_up = str(diff).upper()
+    if diff_up not in ("EASY", "MEDIUM", "HARD"):
+        diff_up = "UNKNOWN"
+    _diff_cache[title_slug] = (diff_up, now_ts)
+    return diff_up
 
 
 def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -270,9 +303,12 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
             continue
 
         title = item.get("title") or "Unknown"
-        if title not in seen:
-            seen.add(title)
-            titles.append(title)
+        slug = item.get("titleSlug") or None
+        key = slug or title
+        if key not in seen:
+            seen.add(key)
+            diff = leetcode_question_difficulty(slug)
+            titles.append(f"{diff} {title}")
 
     _cache[cache_key] = (titles, now_ts)
     return titles, None
@@ -585,20 +621,46 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
-    /check — персонально: сколько задач ты решил сегодня и какие.
+    /check — если без аргументов: твои задачи сегодня.
+    /check @user — задачи указанного пользователя сегодня.
+    /check <leetcode_nick> — задачи по нику LeetCode.
     """
-    user = update.effective_user
     rows = list_users()
-    nick = None
-    uname = user.username or user.full_name
+    if not rows:
+        await update.message.reply_text("Список пуст. Кто первый: /register <nick> 😄")
+        return
 
-    for tid, _, lnick in rows:
-        if int(tid) == int(user.id):
-            nick = lnick
-            break
+    user = update.effective_user
+
+    target_display = mention(user.username or user.full_name)
+    nick = None
+
+    # With argument: /check @user or /check <leetcodeNick>
+    if len(context.args) == 1:
+        target = context.args[0].strip()
+        if target.startswith("@"):
+            t = target.lower()
+            for _, uname, lnick in rows:
+                if mention(uname).lower() == t:
+                    nick = lnick
+                    target_display = mention(uname)
+                    break
+        else:
+            # allow direct leetcode nick
+            nick = target
+            target_display = target
+    else:
+        # no args -> self
+        for tid, _, lnick in rows:
+            if int(tid) == int(user.id):
+                nick = lnick
+                break
 
     if not nick:
-        await update.message.reply_text("Ты не зарегистрирован. Используй /register <nick> 👀")
+        if len(context.args) == 1 and context.args[0].strip().startswith("@"):
+            await update.message.reply_text("Не нашёл пользователя в базе. Пусть он сделает /register <nick> 👀")
+        else:
+            await update.message.reply_text("Ты не зарегистрирован. Используй /register <nick> 👀")
         return
 
     titles, err = accepted_titles_today(nick)
@@ -608,12 +670,13 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⚠️ Ошибка при проверке LeetCode: {err}")
         return
 
+    titles = titles or []
     if not titles:
-        await update.message.reply_text(f"😴 {mention(uname)}, сегодня ({today}) пока 0 задач. Пора спасать статистику!")
+        await update.message.reply_text(f"😴 {target_display}, сегодня ({today}) пока 0 задач. Пора спасать статистику!")
         return
 
     msg = (
-        f"🔥 {mention(uname)}, сегодня ({today}) ты решил {len(titles)} задач:\n"
+        f"🔥 {target_display}, сегодня ({today}) решено {len(titles)} задач:\n"
         + "\n".join([f"• {t}" for t in titles])
     )
     await update.message.reply_text(msg)
@@ -646,7 +709,6 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # allow direct leetcode nick
             nick = target
-
         if not nick:
             await update.message.reply_text("Не нашёл пользователя. Используй /list @username или /list <leetcode_nick>.")
             return
