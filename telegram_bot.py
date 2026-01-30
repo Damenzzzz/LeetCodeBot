@@ -8,8 +8,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 - /list                       — ДЛЯ ВСЕХ: показывает у каждого кол-во решённых задач сегодня + ✅/❌ (решил ≥1 или нет)
 - /list @user                 — ДЛЯ ВСЕХ: показывает названия задач, решённых этим пользователем сегодня
 - /check                      — ДЛЯ ВСЕХ: показывает твои задачи за сегодня (сколько и какие)
-- /week                       — статистика за последние 7 дней (итоги по каждому)
-- /week @user                 — статистика за 7 дней для конкретного пользователя
+- /leaderboard                — общий рейтинг (баллы: EASY=1, MEDIUM=3, HARD=5)
 - /backup                     — (админ) прислать файл базы (регистрации/статистика) для переноса
 
 Авто-уведомления:
@@ -24,7 +23,25 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 Env:
 - TELEGRAM_TOKEN (обязательно)
 - DAILY_HOUR / DAILY_MINUTE (по умолчанию 23:59 Asia/Almaty)
+
+
+добавь функцию remove
+
++ идея улучшить лидерборд через важность уровня задачи 
+Мысалга
+Изи - 1 балл
+Медиум - 3 балл
+Хард - 5 балл
+Сонда лидерборд будет честным учитывая кол-во задач + важность
+
+починить mvp дня, чтобы не показывался не последний участник в случае ничьи а оба.
+
+админ команды.
+
 """
+
+
+
 
 import os
 import json
@@ -44,7 +61,7 @@ from telegram.ext import (
 
 # ----------------- Config -----------------
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
-DB_SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 
@@ -102,6 +119,16 @@ def init_db():
         """
     )
 
+    # leaderboard: persistent points (all-time)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS leaderboard (
+            telegram_id INTEGER PRIMARY KEY,
+            points INTEGER
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -132,8 +159,22 @@ def ensure_db_schema():
         db_set_config("db_schema_version", "1")
         current = 1
 
-    # If you add new migrations later, extend like:
-    # if current < 2: ...; db_set_config("db_schema_version","2"); current=2
+    # v2: leaderboard table (telegram_id -> points)
+    if current < 2:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS leaderboard (
+                telegram_id INTEGER PRIMARY KEY,
+                points INTEGER
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+        db_set_config("db_schema_version", "2")
+        current = 2
 
 def db_set_config(key: str, value: str):
     conn = sqlite3.connect(DB_PATH)
@@ -167,6 +208,8 @@ def remove_user(tid: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE telegram_id=?", (tid,))
+    cur.execute("DELETE FROM daily_stats WHERE telegram_id=?", (tid,))
+    cur.execute("DELETE FROM leaderboard WHERE telegram_id=?", (tid,))
     conn.commit()
     conn.close()
 
@@ -189,6 +232,115 @@ def save_daily_stats(day: str, tid: int, solved_count: int, titles: List[str]):
     )
     conn.commit()
     conn.close()
+
+
+
+def _points_for_difficulty(diff: str) -> int:
+    d = (diff or "").strip().upper()
+    if d == "EASY":
+        return 1
+    if d == "MEDIUM":
+        return 3
+    if d == "HARD":
+        return 5
+    return 0
+
+
+def points_from_titles(titles: List[str]) -> int:
+    # Titles format in this bot: "EASY Two Sum" / "MEDIUM ..." / "HARD ..."
+    total = 0
+    for t in titles or []:
+        try:
+            first = (t or "").split(" ", 1)[0]
+        except Exception:
+            first = ""
+        total += _points_for_difficulty(first)
+    return total
+
+
+def recompute_leaderboard_from_daily_stats():
+    """Rebuilds all-time leaderboard points from daily_stats.titles_json."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("DELETE FROM leaderboard")
+
+    cur.execute("SELECT telegram_id, titles_json FROM daily_stats")
+    rows = cur.fetchall()
+
+    totals: Dict[int, int] = {}
+    for tid, titles_json in rows:
+        try:
+            titles = json.loads(titles_json or "[]")
+        except Exception:
+            titles = []
+        totals[int(tid)] = totals.get(int(tid), 0) + points_from_titles(titles)
+
+    for tid, pts in totals.items():
+        cur.execute("REPLACE INTO leaderboard(telegram_id, points) VALUES(?,?)", (int(tid), int(pts)))
+
+    conn.commit()
+    conn.close()
+
+
+def get_leaderboard_points() -> Dict[int, int]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, points FROM leaderboard")
+    rows = cur.fetchall()
+    conn.close()
+    return {int(tid): int(pts or 0) for tid, pts in rows}
+
+
+def aggregate_all_time_from_daily_stats() -> Dict[int, Dict[str, object]]:
+    """
+    Aggregates lifetime stats from daily_stats:
+    returns {telegram_id: {"total_solved": int, "last_active_day": str|None, "easy": int, "medium": int, "hard": int}}
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT day, telegram_id, solved_count, titles_json FROM daily_stats")
+    rows = cur.fetchall()
+    conn.close()
+
+    agg: Dict[int, Dict[str, object]] = {}
+    for day_str, tid, solved_count, titles_json in rows:
+        tid = int(tid)
+        if tid not in agg:
+            agg[tid] = {"total_solved": 0, "last_active_day": None, "easy": 0, "medium": 0, "hard": 0}
+        a = agg[tid]
+
+        try:
+            titles = json.loads(titles_json) if titles_json else []
+        except Exception:
+            titles = []
+
+        # total solved tasks across all days (prefer titles list length if present)
+        cnt = len(titles) if titles else int(solved_count or 0)
+        a["total_solved"] = int(a["total_solved"]) + cnt
+
+        if cnt > 0:
+            # keep the most recent day string (YYYY-MM-DD)
+            last = a["last_active_day"]
+            if (last is None) or (str(day_str) > str(last)):
+                a["last_active_day"] = str(day_str)
+
+        for t in titles:
+            if not isinstance(t, str):
+                continue
+            parts = t.split(" ", 1)
+            if not parts:
+                continue
+            diff = parts[0].strip().upper()
+            if diff == "EASY":
+                a["easy"] = int(a["easy"]) + 1
+            elif diff == "MEDIUM":
+                a["medium"] = int(a["medium"]) + 1
+            elif diff == "HARD":
+                a["hard"] = int(a["hard"]) + 1
+
+    return agg
+
 
 
 def get_week_stats(days: List[str]):
@@ -378,35 +530,65 @@ async def _is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 
+
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
-    /backup — admin-only: sends the SQLite DB file to the admin as a document.
-    Useful before moving to VPS (Oracle) or after redeploys on ephemeral storage.
+    /backup — admin-only: sends JSON backup (users/daily_stats/config/leaderboard).
+    Use it with /restore (owner-only).
     """
     if not await _is_admin(update, context):
-        await update.message.reply_text(
-            "⛔ Эта команда только для админа.\n"
-            "Если хочешь включить админ-доступ в личке — задай переменную ADMIN_IDS (id через запятую)."
-        )
+        await update.message.reply_text("⛔ Эта команда только для админа.")
         return
 
-    db_path = DB_PATH
-    if not os.path.exists(db_path):
-        await update.message.reply_text(f"База не найдена по пути: {db_path}")
-        return
-
-    # A tiny “fun” message
-    await update.message.reply_text("🧳 Пакую базу в чемодан… ща прилетит 📦")
+    await update.message.reply_text("🧳 Собираю бэкап в JSON… ща прилетит 📦")
 
     try:
-        with open(db_path, "rb") as f:
-            filename = os.path.basename(db_path)
-            await update.message.reply_document(document=f, filename=filename, caption="✅ Вот бэкап базы. Не теряй 😄")
-    except Exception as e:
-        logger.exception("Backup send failed: %s", e)
-        await update.message.reply_text(f"⚠️ Не смог отправить файл базы: {e}")
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
 
+        cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
+        users_rows = [
+            {"telegram_id": int(tid), "username": str(uname), "leetcode_nick": str(nick)}
+            for tid, uname, nick in cur.fetchall()
+        ]
+
+        cur.execute("SELECT day, telegram_id, solved_count, titles_json FROM daily_stats")
+        stats_rows = []
+        for day, tid, cnt, titles_json in cur.fetchall():
+            stats_rows.append(
+                {"day": str(day), "telegram_id": int(tid), "solved_count": int(cnt or 0), "titles_json": titles_json or "[]"}
+            )
+
+        cur.execute("SELECT key, value FROM config")
+        config_rows = {str(k): str(v) for k, v in cur.fetchall()}
+
+        cur.execute("SELECT telegram_id, points FROM leaderboard")
+        leaderboard_rows = [{"telegram_id": int(tid), "points": int(pts or 0)} for tid, pts in cur.fetchall()]
+
+        conn.close()
+
+        data = {
+            "schema_version": DB_SCHEMA_VERSION,
+            "exported_at": _now_str(),
+            "tables": {
+                "users": users_rows,
+                "daily_stats": stats_rows,
+                "config": config_rows,
+                "leaderboard": leaderboard_rows,
+            },
+        }
+
+        out_path = os.path.join(os.path.dirname(DB_PATH) or ".", "backup.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        with open(out_path, "rb") as f:
+            await update.message.reply_document(document=f, filename="backup.json", caption="✅ Вот JSON-бэкап (включая лидерборд).")
+
+    except Exception as e:
+        logger.exception("Backup failed: %s", e)
+        await update.message.reply_text(f"⚠️ Не смог сделать/отправить бэкап: {e}")
 
 
 async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -458,12 +640,14 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_rows = data.get("users")
     stats_rows = data.get("daily_stats")
     config_rows = data.get("config")
+    leaderboard_rows = data.get("leaderboard")
 
     if isinstance(data.get("tables"), dict):
         t = data["tables"]
         users_rows = users_rows or t.get("users")
         stats_rows = stats_rows or t.get("daily_stats")
         config_rows = config_rows or t.get("config")
+        leaderboard_rows = leaderboard_rows or t.get("leaderboard")
 
     if users_rows is None and stats_rows is None and config_rows is None:
         await update.message.reply_text("⚠️ Это не похоже на бэкап (нет users/daily_stats/config).")
@@ -480,6 +664,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("DELETE FROM users")
         cur.execute("DELETE FROM daily_stats")
         cur.execute("DELETE FROM config")
+        cur.execute("DELETE FROM leaderboard")
 
         # Restore config
         if config_rows:
@@ -530,8 +715,30 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 stats_count += 1
 
+
+        # Restore leaderboard (optional). If not present, rebuild from daily_stats (legacy backups).
+        leaderboard_count = 0
+        if leaderboard_rows:
+            for row in leaderboard_rows:
+                tid = row.get("telegram_id") or row.get("tid")
+                pts = row.get("points") or row.get("score") or 0
+                if tid is None:
+                    continue
+                cur.execute(
+                    "REPLACE INTO leaderboard(telegram_id, points) VALUES(?,?)",
+                    (int(tid), int(pts)),
+                )
+                leaderboard_count += 1
+        else:
+            # Legacy migration: old backups had /week only; points are rebuilt from daily_stats titles_json.
+            # This will convert previous history into the new all-time points leaderboard.
+            pass
+
         conn.commit()
         conn.close()
+
+        if not leaderboard_rows:
+            recompute_leaderboard_from_daily_stats()
 
         _cache.clear()
 
@@ -539,7 +746,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Восстановление завершено!"
             f"• users: {users_count}"
             f"• daily_stats: {stats_count}"
-            "Можно продолжать: /list, /week."
+            "Можно продолжать: /list, /leaderboard."
         )
     except Exception as e:
         logger.exception("Restore failed: %s", e)
@@ -557,9 +764,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /check — твои задачи сегодня\n"
         "• /list — статус всех сегодня\n"
         "• /list @user — задачи пользователя сегодня\n"
-        "• /week — статистика за 7 дней\n"
-        "• /setgroup — (админ) куда слать напоминания\n"
-        "• /info — полная информация по боту и командам\n\n"
+        "• /leaderboard — общий рейтинг (баллы)\n"
+        "• /listtask @user — список + задачи пользователя\n"
+                "• /info — полная информация по боту и командам\n\n"
         "Правило простое: минимум 1 задача в день ✅"
     )
 
@@ -751,70 +958,208 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(header + "\n" + "\n".join(lines))
 
 
-async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
-    /week — 7-day totals for everyone (from stored daily snapshots)
-    /week @user — 7-day breakdown for one user
+    /leaderboard — all-time points leaderboard.
+    Optional: /leaderboard @user (or /leaderboard <leetcode_nick>) — shows that user's stats + rank.
+    Points:
+      EASY = +1, MEDIUM = +3, HARD = +5
+    Tie-breaks (if points equal):
+      1) total solved tasks (all-time) higher first
+      2) last activity more recent first
     """
     rows = list_users()
     if not rows:
         await update.message.reply_text("Пока нет зарегистрированных. /register <nick>")
         return
 
-    today = datetime.now(TZ).date()
-    days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]  # oldest..today
-    week_map = get_week_stats(days)
+    points_map = get_leaderboard_points()
+    agg = aggregate_all_time_from_daily_stats()
 
-    # /week @user
+    entries = []
+    for tid, uname, nick in rows:
+        tid_i = int(tid)
+        a = agg.get(tid_i, {"total_solved": 0, "last_active_day": None, "easy": 0, "medium": 0, "hard": 0})
+        pts = int(points_map.get(tid_i, 0))
+        total = int(a.get("total_solved", 0) or 0)
+        last = a.get("last_active_day")
+        entries.append({
+            "tid": tid_i,
+            "name": mention(uname),
+            "nick": nick,
+            "pts": pts,
+            "total": total,
+            "last": str(last) if last else ""
+        })
+
+    entries.sort(key=lambda e: (e["pts"], e["total"], e["last"]), reverse=True)
+
+    # Optional: show single user stats
     if len(context.args) == 1:
         target = context.args[0].strip()
         target_tid = None
-        target_uname = target
+        target_name = None
 
         if target.startswith("@"):
             t = target.lower()
-            for tid, uname, _ in rows:
-                if mention(uname).lower() == t:
-                    target_tid = int(tid)
-                    target_uname = mention(uname)
+            for e in entries:
+                if e["name"].lower() == t:
+                    target_tid = e["tid"]
+                    target_name = e["name"]
                     break
         else:
-            # allow by LeetCode nick
-            for tid, uname, nick in rows:
-                if nick.lower() == target.lower():
-                    target_tid = int(tid)
-                    target_uname = mention(uname)
+            # allow direct leetcode nick
+            for e in entries:
+                if str(e["nick"]).lower() == target.lower():
+                    target_tid = e["tid"]
+                    target_name = e["name"]
                     break
 
         if target_tid is None:
-            await update.message.reply_text("Не нашёл пользователя. Используй /week @username или /week <leetcode_nick>.")
+            await update.message.reply_text("Не нашёл пользователя. Используй /leaderboard @username или /leaderboard <leetcode_nick>.")
             return
 
-        per_day = week_map.get(target_tid, {})
-        total = sum(per_day.get(d, 0) for d in days)
-        msg = [f"📅 Неделя для {target_uname} (последние 7 дней):", f"Итого: {total} задач\n"]
-        for d in days:
-            msg.append(f"{d}: {per_day.get(d, 0)}")
-        await update.message.reply_text("\n".join(msg))
+        a = agg.get(target_tid, {"total_solved": 0, "last_active_day": None, "easy": 0, "medium": 0, "hard": 0})
+        pts = int(points_map.get(target_tid, 0))
+        total = int(a.get("total_solved", 0) or 0)
+        last = a.get("last_active_day") or "нет"
+        easy = int(a.get("easy", 0) or 0)
+        medium = int(a.get("medium", 0) or 0)
+        hard = int(a.get("hard", 0) or 0)
+
+        rank = 1
+        for i, e in enumerate(entries, start=1):
+            if e["tid"] == target_tid:
+                rank = i
+                break
+
+        msg = (
+            f"📌 {target_name}\n"
+            f"Баллы: {pts}\n"
+            f"EASY: {easy} | MEDIUM: {medium} | HARD: {hard}\n"
+            f"Всего решено: {total}\n"
+            f"Последняя активность: {last}\n"
+            f"Ранг: #{rank} из {len(entries)}\n\n"
+        )
+    else:
+        msg = ""
+
+    header = "🏆 Лидерборд (все время)\n(EASY=1, MEDIUM=3, HARD=5)\n"
+    lines = []
+    top = entries[0]["pts"] if entries else 0
+    for e in entries:
+        trophy = "🥇" if e["pts"] == top and e["pts"] > 0 else ""
+        lines.append(f'{e["name"]}: {e["pts"]} балл(ов) {trophy}'.rstrip())
+
+    await update.message.reply_text(msg + header + "\n".join(lines))
+
+async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    """
+    /removeuser @user — admin-only: removes a user from bot (users + stats + leaderboard).
+    """
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
         return
 
-    # /week summary
-    msg_lines = ["📊 Статистика за неделю (последние 7 дней):", "(данные из ежедневных снимков бота)\n"]
-    scores = []
+    if len(context.args) != 1:
+        await update.message.reply_text("Использование: /removeuser @username  ИЛИ  /removeuser <leetcode_nick>")
+        return
+
+    target = context.args[0].strip()
+    rows = list_users()
+
+    target_tid = None
+    target_uname = None
+
+    if target.startswith("@"):
+        t = target.lower()
+        for tid, uname, _ in rows:
+            if mention(uname).lower() == t:
+                target_tid = int(tid)
+                target_uname = mention(uname)
+                break
+    else:
+        # allow removing by leetcode nick
+        for tid, uname, lnick in rows:
+            if str(lnick).lower() == target.lower():
+                target_tid = int(tid)
+                target_uname = mention(uname)
+                break
+
+    if target_tid is None:
+        await update.message.reply_text("Не нашёл пользователя в базе.")
+        return
+
+    target_uname = None
+    t = target.lower()
+
     for tid, uname, _ in rows:
-        per_day = week_map.get(int(tid), {})
-        total = sum(per_day.get(d, 0) for d in days)
-        scores.append((total, mention(uname)))
+        if mention(uname).lower() == t:
+            target_tid = int(tid)
+            target_uname = mention(uname)
+            break
 
-    scores.sort(reverse=True, key=lambda x: x[0])
-    for total, uname in scores:
-        trophy = "🏆" if total == scores[0][0] and total > 0 else ""
-        msg_lines.append(f"{uname}: {total} задач {trophy}")
+    if target_tid is None:
+        await update.message.reply_text("Не нашёл пользователя в базе.")
+        return
 
-    await update.message.reply_text("\n".join(msg_lines))
+    remove_user(target_tid)
+    recompute_leaderboard_from_daily_stats()
 
-    
+    await update.message.reply_text(f"✅ Удалил {target_uname} из бота.")
+
+
+async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    """
+    /listtask @user — like /list, but additionally prints the user's solved tasks (with difficulty) under their line.
+    """
+    rows = list_users()
+    if not rows:
+        await update.message.reply_text("Список пуст. Кто первый: /register <nick> 😄")
+        return
+
+    if len(context.args) != 1 or not context.args[0].strip().startswith("@"):
+        await update.message.reply_text("Использование: /listtask @username")
+        return
+
+    target = context.args[0].strip().lower()
+
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
+
+    scored = []  # (cnt, name, line, had_error, titles)
+    for _, uname, nick in rows:
+        titles, err = accepted_titles_today(nick)
+        name = mention(uname)
+        if err:
+            scored.append((-1, name, f"{name} — ❓ ошибка проверки", True, []))
+            continue
+
+        titles = titles or []
+        cnt = len(titles)
+        mark = "✅" if cnt >= 1 else "❌"
+        scored.append((cnt, name, f"{name} — {cnt} задач {mark}", False, titles))
+
+    scored.sort(key=lambda x: (x[3], -x[0], x[1].lower()))
+
+    lines = []
+    for cnt, name, line, had_error, titles in scored:
+        lines.append(line)
+        if name.lower() == target and (not had_error):
+            if titles:
+                lines.append("   └ решённые задачи:")
+                for t in titles:
+                    lines.append(f"      • {t}")
+            else:
+                lines.append("   └ решённых задач сегодня нет.")
+
+    await update.message.reply_text(header + "\n" + "\n".join(lines))
+
+
 # ----------------- Jobs: reminder + daily report -----------------
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Reminder tick at %s", _now_str())
@@ -852,7 +1197,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "🎉 ВСЕ МОЛОДЦЫ!"
+                    "🎉 ВСЕ МОЛОДЦЫ! \n"
                     "Каждый решил минимум 1 задачу сегодня 💪🔥"
                     "Группа официально НЕ ленивая 😎"
                 ),
@@ -868,7 +1213,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         text=(
             f"{e} Напоминалка: сегодня ещё без задач:"
             + ", ".join(not_done)
-            + "Правило простое: минимум 1 задача. Погнали! 🚀"
+            + " \nПравило простое: минимум 1 задача. Погнали! 🚀"
         ),
     )
 
@@ -894,13 +1239,14 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
     day_str = day.strftime("%Y-%m-%d")
 
     report_lines = []
-    mvp = ("", -1)  # (uname, count)
+    mvp_max = -1
+    mvp_winners: List[str] = []
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
         if err:
-            report_lines.append(f"{mention(uname)} — ❓ ошибка проверки")
-            save_daily_stats(day_str, int(tid), 0, [])
+            report_lines.append(f"{mention(uname)} — ❓ ошибка проверки (LeetCode недоступен)")
+            # не трогаем прошлые данные, просто пропускаем сохранение
             continue
 
         titles = titles or []
@@ -910,22 +1256,27 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
 
         save_daily_stats(day_str, int(tid), cnt, titles)
 
-        if cnt > mvp[1]:
-            mvp = (mention(uname), cnt)
+        if cnt > mvp_max:
+            mvp_max = cnt
+            mvp_winners = [mention(uname)]
+        elif cnt == mvp_max and cnt > 0:
+            mvp_winners.append(mention(uname))
 
     # MVP message
-    if mvp[1] <= 0:
+    if mvp_max <= 0:
         mvp_line = "🏆 MVP дня: сегодня без победителей… но завтра новый шанс 😄"
     else:
-        mvp_line = f"🏆 MVP дня: {mvp[0]} — {mvp[1]} задач(и) 🔥"
+        winners = ", ".join(mvp_winners)
+        mvp_line = f"🏆 MVP дня: {winners} — {mvp_max} задач(и) 🔥"
 
     header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await context.bot.send_message(chat_id=chat_id, text=text)
+    _set_last_report_day(day_str)
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard — общий рейтинг (баллы: EASY=1, MEDIUM=3, HARD=5)\n • /listtask @user — как /list, но ещё выводит решённые задачи пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -952,6 +1303,7 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("catchup_job failed: %s", e)
 
 
+
 # ----------------- Main -----------------
 def main():
     init_db()
@@ -968,7 +1320,9 @@ def main():
     app.add_handler(CommandHandler("setgroup", setgroup))
     app.add_handler(CommandHandler("list", listcmd))
     app.add_handler(CommandHandler("check", check))
-    app.add_handler(CommandHandler("week", week))
+    app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("listtask", listtask))
+    app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore))  # hidden owner-only
