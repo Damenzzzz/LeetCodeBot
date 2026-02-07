@@ -67,9 +67,9 @@ LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 
 DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
-DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "30"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "58"))
 
-REMINDER_INTERVAL_SECONDS = 5 * 60 * 60  # 3 hours
+REMINDER_INTERVAL_SECONDS = 5 * 60 * 60  # 5 hours
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
