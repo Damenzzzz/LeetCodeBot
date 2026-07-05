@@ -79,6 +79,8 @@ OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # your personal Telegram user_id; se
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # in-memory cache: (nick, yyyy-mm-dd) -> (titles_list, fetched_at_epoch_seconds)
 _cache: Dict[Tuple[str, str], Tuple[List[str], float]] = {}
