@@ -677,19 +677,28 @@ def _get_daily_time_from_config() -> Tuple[int, int]:
 
 async def maybe_set_group_chat(update: Update):
     """
-    Надёжность для Railway Trial:
-    - Если бот получает любую команду в группе/супергруппе, запоминаем chat_id как report_chat_id.
-    Это нужно, потому что на Railway Trial БД может очищаться после деплоя и /setgroup забывается.
+    Keep this hook for backward compatibility with handlers that call it.
+    Report chat/topic is configured explicitly by /setgroup.
     """
+    return
+
+
+def _get_report_thread_id() -> Optional[int]:
+    raw = db_get_config("report_message_thread_id")
+    if not raw:
+        return None
     try:
-        chat = update.effective_chat
-        if chat and chat.type in ("group", "supergroup"):
-            cur = db_get_config("report_chat_id")
-            if cur != str(chat.id):
-                db_set_config("report_chat_id", str(chat.id))
-                logger.info("Auto-set report_chat_id=%s at %s", chat.id, _now_str())
-    except Exception as e:
-        logger.warning("maybe_set_group_chat failed: %s", e)
+        return int(raw)
+    except Exception:
+        return None
+
+
+async def send_report_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
+    thread_id = _get_report_thread_id()
+    kwargs = {"chat_id": chat_id, "text": text}
+    if thread_id is not None:
+        kwargs["message_thread_id"] = thread_id
+    await context.bot.send_message(**kwargs)
 
 
 def _get_last_report_day() -> Optional[str]:
@@ -1022,6 +1031,7 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     chat = update.effective_chat
     user = update.effective_user
+    msg = update.effective_message
     if chat.type not in ("group", "supergroup"):
         await update.message.reply_text("Команда /setgroup должна быть вызвана в группе.")
         return
@@ -1032,7 +1042,13 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db_set_config("report_chat_id", str(chat.id))
-    await update.message.reply_text("📌 Ок! Эта группа теперь получает напоминания/отчёты.")
+    thread_id = getattr(msg, "message_thread_id", None)
+    if thread_id is not None:
+        db_set_config("report_message_thread_id", str(thread_id))
+        await update.message.reply_text("📌 Ок! Напоминания/отчёты будут приходить в этот топик.")
+    else:
+        db_set_config("report_message_thread_id", "")
+        await update.message.reply_text("📌 Ок! Эта группа теперь получает напоминания/отчёты.")
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1590,9 +1606,10 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     if not not_done:
         flag_key = f"all_done_{today_str}"
         if not db_get_config(flag_key):
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
+            await send_report_message(
+                context,
+                chat_id,
+                (
                     "🎉 ВСЕ МОЛОДЦЫ! \n"
                     "Каждый решил минимум 1 задачу сегодня 💪🔥"
                     "Группа официально НЕ ленивая 😎"
@@ -1604,9 +1621,10 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     # Still slackers -> fun ping
     emojis = ["⏰", "🚨", "👀", "🧠", "🔥"]
     e = emojis[int(datetime.now(TZ).timestamp()) % len(emojis)]
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
+    await send_report_message(
+        context,
+        chat_id,
+        (
             f"{e} Напоминалка: сегодня ещё без задач:"
             + ", ".join(not_done)
             + " \nПравило простое: минимум 1 задача. Погнали! 🚀"
@@ -1626,7 +1644,7 @@ async def daily_report_job(
 
     rows = list_users()
     if not rows:
-        await context.bot.send_message(chat_id=chat_id, text="Сегодня никого не было в списке 😄")
+        await send_report_message(context, chat_id, "Сегодня никого не было в списке 😄")
         return
 
     day = target_day or datetime.now(TZ).date()
@@ -1713,7 +1731,7 @@ async def daily_report_job(
 
     header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
-    await context.bot.send_message(chat_id=chat_id, text=text)
+    await send_report_message(context, chat_id, text)
     if should_apply_warns:
         db_set_config(warns_key, "1")
     _set_last_report_day(day_str)
