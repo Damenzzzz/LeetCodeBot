@@ -355,6 +355,14 @@ def clear_warns(tid: int):
     conn.commit()
     conn.close()
 
+
+def clear_all_warns():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM warns")
+    conn.commit()
+    conn.close()
+
 def _parse_task_entry(s: str) -> Tuple[str, str, str]:
     """Parse stored task entry into (difficulty, title, titleSlug). Backward-compatible with old rows."""
     try:
@@ -1375,16 +1383,20 @@ async def settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    user = update.effective_user
-    if not user or not OWNER_ID or user.id != OWNER_ID:
-        await update.message.reply_text("⛔ Нет доступа.")
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
         return
 
     if len(context.args) != 1:
-        await update.message.reply_text("Использование: /unwarn @username  ИЛИ  /unwarn <leetcode_nick>")
+        await update.message.reply_text("Использование: /unwarn @username  ИЛИ  /unwarn <leetcode_nick>  ИЛИ  /unwarn all")
         return
 
     target = context.args[0].strip()
+    if target.lower() in ("all", "все", "everyone"):
+        clear_all_warns()
+        await update.message.reply_text("✅ Предупреждения сброшены для всех участников.")
+        return
+
     rows = list_users()
 
     target_tid = None
@@ -1707,7 +1719,7 @@ async def daily_report_job(
     _set_last_report_day(day_str)
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Админ-команды:*\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
