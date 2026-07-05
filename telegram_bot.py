@@ -1007,7 +1007,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     titles, err = accepted_titles_today(nick)
     if err:
         await update.message.reply_text(
-            f"🔥 Готово! Ты зарегистрирован как: {nick}"
+            f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
             "⚠️ Но LeetCode сейчас не ответил — позже /check покажет всё нормально."
         )
         return
@@ -1015,8 +1015,8 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cnt = len(titles or [])
     mark = "✅" if cnt >= 1 else "❌"
     await update.message.reply_text(
-        f"🔥 Готово! Ты зарегистрирован как: {nick}"
-        f"Сегодня у тебя: {cnt} задач {mark}"
+        f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
+        f"Сегодня у тебя: {cnt} задач {mark}\n"
         "Теперь ты в общем списке /list (если вдруг не видно — сделай /list ещё раз через 5–10 сек 😄)"
     )
 
