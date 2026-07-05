@@ -1523,11 +1523,11 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
-async def _week_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
-    /week — 7-day totals for everyone (from stored daily snapshots)
-    /week @user — 7-day breakdown for one user
+    /week — totals for everyone from Monday to today.
+    /week @user — breakdown for one user from Monday to today.
     """
     rows = list_users()
     if not rows:
@@ -1535,7 +1535,21 @@ async def _week_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     today = datetime.now(TZ).date()
-    days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)]  # oldest..today
+    week_start = today - timedelta(days=today.weekday())
+    dates = [week_start + timedelta(days=i) for i in range((today - week_start).days + 1)]
+    days = [d.strftime("%Y-%m-%d") for d in dates]
+
+    # Refresh snapshots for the current week so /week does not depend only on daily reports.
+    for day_obj, day_str in zip(dates, days):
+        for tid, _uname, nick in rows:
+            titles, err = accepted_titles_on_day(nick, day_obj)
+            if err:
+                continue
+            try:
+                update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
+            except Exception:
+                pass
+
     week_map = get_week_stats(days)
 
     # /week @user
@@ -1565,21 +1579,25 @@ async def _week_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         per_day = week_map.get(target_tid, {})
         total = sum(per_day.get(d, 0) for d in days)
-        msg = [f"📅 Неделя для {target_uname} (последние 7 дней):", f"Итого: {total} задач\n"]
+        msg = [
+            f"📅 List начиная с дня {week_start.strftime('%Y-%m-%d')}",
+            f"Пользователь: {target_uname}",
+            f"Итого: {total} задач\n",
+        ]
         for d in days:
             msg.append(f"{d}: {per_day.get(d, 0)}")
         await update.message.reply_text("\n".join(msg))
         return
 
     # /week summary
-    msg_lines = ["📊 Статистика за неделю (последние 7 дней\n"]
+    msg_lines = [f"📊 List начиная с дня {week_start.strftime('%Y-%m-%d')}"]
     scores = []
     for tid, uname, _ in rows:
         per_day = week_map.get(int(tid), {})
         total = sum(per_day.get(d, 0) for d in days)
         scores.append((total, mention(uname)))
 
-    scores.sort(reverse=True, key=lambda x: x[0])
+    scores.sort(key=lambda x: (-x[0], x[1].lower()))
     for total, uname in scores:
         trophy = "🏆" if total == scores[0][0] and total > 0 else ""
         msg_lines.append(f"{uname}: {total} задач {trophy}")
@@ -1756,7 +1774,7 @@ async def daily_report_job(
     _set_last_report_day(day_str)
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -1801,6 +1819,7 @@ def main():
     app.add_handler(CommandHandler("cleargroup", cleargroup))
     app.add_handler(CommandHandler("list", listcmd))
     app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("listtask", listtask))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
