@@ -1111,6 +1111,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /check — твои задачи сегодня\n"
         "• /list — статус всех сегодня\n"
         "• /list @user — задачи пользователя сегодня\n"
+        "• /leaderboard — рейтинг по баллам (Easy=1, Medium=3, Hard=5)\n"
         "• /week — статистика за 7 дней\n"
         "• /setgroup — (админ) куда слать напоминания\n"
         "• /info — полная информация по боту и командам\n\n"
@@ -1142,6 +1143,10 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     cnt = len(titles or [])
+    try:
+        update_snapshot_and_leaderboard(today_key, int(user.id), cnt, titles or [])
+    except Exception:
+        pass
     mark = "✅" if cnt >= 1 else "❌"
     await update.message.reply_text(
         f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
@@ -1374,6 +1379,18 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пока нет зарегистрированных. /register <nick>")
         return
 
+    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    errors = []
+    for tid, uname, nick in rows:
+        titles, err = accepted_titles_today(nick)
+        if err:
+            errors.append(mention(uname))
+            continue
+        try:
+            update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
+        except Exception as e:
+            logger.warning("leaderboard live update failed for %s: %s", nick, e)
+
     points_map = get_leaderboard_points()
     entries = []
     for tid, uname, _nick in rows:
@@ -1387,8 +1404,11 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trophy = " 🥇" if pts == top_pts and pts > 0 else ""
         lines.append(f"{name}: {pts} балл(ов){trophy}")
 
-    header = "🏆 Лидерборд (все время)\n(EASY=1, MEDIUM=3, HARD=5)\n"
-    await update.message.reply_text(header + "\n".join(lines))
+    header = "🏆 Лидерборд\nEasy = 1 балл, Medium = 3 балла, Hard = 5 баллов\n"
+    text = header + "\n".join(lines)
+    if errors:
+        text += "\n\n⚠️ Не смог обновить сейчас: " + ", ".join(errors)
+    await update.message.reply_text(text)
 
 
 async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1907,7 +1927,7 @@ async def daily_report_job(
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -1954,6 +1974,7 @@ def main():
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("top", leaderboard))
     app.add_handler(CommandHandler("listtask", listtask))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("who", who))
