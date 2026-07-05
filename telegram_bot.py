@@ -65,6 +65,8 @@ DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DB_SCHEMA_VERSION = 3
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
+LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
+TASK_SLUG_SEP = "||"
 
 DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
 DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "58"))
@@ -273,11 +275,8 @@ def _points_for_difficulty(diff: str) -> int:
 def points_from_titles(titles: List[str]) -> int:
     total = 0
     for t in titles or []:
-        try:
-            first = (t or "").split(" ", 1)[0]
-        except Exception:
-            first = ""
-        total += _points_for_difficulty(first)
+        diff, _title, _slug = _parse_task_entry(t)
+        total += _points_for_difficulty(diff)
     return total
 
 
@@ -354,19 +353,46 @@ def clear_warns(tid: int):
     conn.commit()
     conn.close()
 
-def _split_diff_title(s: str) -> Tuple[str, str]:
-    """Splits 'DIFF Title' -> (diff, title). If format is unexpected, returns ('UNKNOWN', original)."""
+def _parse_task_entry(s: str) -> Tuple[str, str, str]:
+    """Parse stored task entry into (difficulty, title, titleSlug). Backward-compatible with old rows."""
     try:
-        parts = (s or "").split(" ", 1)
+        raw = s or ""
+        if TASK_SLUG_SEP in raw:
+            raw, slug = raw.rsplit(TASK_SLUG_SEP, 1)
+            slug = (slug or "").strip()
+        else:
+            slug = ""
+
+        parts = raw.split(" ", 1)
         if len(parts) == 2:
             diff = (parts[0] or "").strip().upper() or "UNKNOWN"
             title = (parts[1] or "").strip() or "Unknown"
             if diff not in ("EASY", "MEDIUM", "HARD"):
                 diff = "UNKNOWN"
-            return diff, title
+            return diff, title, slug
     except Exception:
         pass
-    return "UNKNOWN", (s or "").strip() or "Unknown"
+    return "UNKNOWN", (s or "").strip() or "Unknown", ""
+
+
+def _encode_task_entry(diff: str, title: str, slug: Optional[str]) -> str:
+    diff_up = (diff or "UNKNOWN").strip().upper()
+    if diff_up not in ("EASY", "MEDIUM", "HARD"):
+        diff_up = "UNKNOWN"
+    clean_title = (title or "Unknown").strip() or "Unknown"
+    clean_slug = (slug or "").strip()
+    if clean_slug:
+        return f"{diff_up} {clean_title}{TASK_SLUG_SEP}{clean_slug}"
+    return f"{diff_up} {clean_title}"
+
+
+def _format_task_entry(s: str) -> str:
+    diff, title, slug = _parse_task_entry(s)
+    points = _points_for_difficulty(diff)
+    prefix = f"{diff} (+{points})" if points else diff
+    if slug:
+        return f"{prefix} {title} — https://leetcode.com/problems/{slug}/"
+    return f"{prefix} {title}"
 
 
 def _merge_titles(old_titles: List[str], new_titles: List[str]) -> List[str]:
@@ -376,23 +402,35 @@ def _merge_titles(old_titles: List[str], new_titles: List[str]) -> List[str]:
     - If difficulty was UNKNOWN and later becomes known, we upgrade it (prevents undercount).
     Key is the problem title (without difficulty prefix).
     """
-    by_title: Dict[str, str] = {}
+    by_key: Dict[str, Tuple[str, str, str]] = {}
 
     for t in old_titles or []:
-        diff, title = _split_diff_title(t)
-        by_title[title] = diff
+        diff, title, slug = _parse_task_entry(t)
+        key = slug or title.lower()
+        by_key[key] = (diff, title, slug)
 
     for t in new_titles or []:
-        diff, title = _split_diff_title(t)
-        if title not in by_title:
-            by_title[title] = diff
+        diff, title, slug = _parse_task_entry(t)
+        key = slug or title.lower()
+        old_title_key = title.lower()
+        if slug and key not in by_key and old_title_key in by_key:
+            old_diff, old_title, old_slug = by_key.pop(old_title_key)
+            by_key[key] = (old_diff, old_title, old_slug)
+        if key not in by_key:
+            by_key[key] = (diff, title, slug)
         else:
             # upgrade UNKNOWN -> known
-            if (by_title[title] == "UNKNOWN") and (diff in ("EASY", "MEDIUM", "HARD")):
-                by_title[title] = diff
+            old_diff, old_title, old_slug = by_key[key]
+            if old_diff == "UNKNOWN" and diff in ("EASY", "MEDIUM", "HARD"):
+                by_key[key] = (diff, title or old_title, slug or old_slug)
+            elif not old_slug and slug:
+                by_key[key] = (old_diff, old_title, slug)
 
     # stable output (alphabetical titles)
-    merged = [f"{by_title[title]} {title}" for title in sorted(by_title.keys(), key=lambda x: x.lower())]
+    merged = [
+        _encode_task_entry(diff, title, slug)
+        for diff, title, slug in sorted(by_key.values(), key=lambda x: x[1].lower())
+    ]
     return merged
 
 
@@ -476,15 +514,35 @@ def nick_escape(s: str) -> str:
     return s.replace('"', '\\"')
 
 
-def leetcode_recent_submissions(nick: str):
-    q = (
-        '{ recentSubmissionList(username: "%s") { title titleSlug timestamp statusDisplay } }'
-        % nick_escape(nick)
-    )
-    resp = requests.post(LEETCODE_GRAPHQL, json={"query": q}, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    return data.get("data", {}).get("recentSubmissionList") or []
+def leetcode_recent_accepted_submissions(nick: str):
+    q = """
+    query recentAccepted($username: String!, $limit: Int!) {
+      recentAcSubmissionList(username: $username, limit: $limit) {
+        title
+        titleSlug
+        timestamp
+      }
+    }
+    """
+    last_err = None
+    for _attempt in range(3):
+        try:
+            resp = requests.post(
+                LEETCODE_GRAPHQL,
+                json={
+                    "query": q,
+                    "variables": {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT},
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errors"):
+                raise RuntimeError(data["errors"])
+            return data.get("data", {}).get("recentAcSubmissionList") or []
+        except Exception as e:
+            last_err = e
+    raise last_err
 
 
 
@@ -534,7 +592,7 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
         return cached[0], None
 
     try:
-        subs = leetcode_recent_submissions(nick)
+        subs = leetcode_recent_accepted_submissions(nick)
     except Exception as e:
         logger.exception("LeetCode fetch error for %s: %s", nick, e)
         return None, str(e)
@@ -559,16 +617,13 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
         if dt.date() != target_day:
             continue
 
-        if item.get("statusDisplay") != "Accepted":
-            continue
-
         title = item.get("title") or "Unknown"
         slug = item.get("titleSlug") or None
         key = slug or title
         if key not in seen:
             seen.add(key)
             diff = leetcode_question_difficulty(slug)
-            titles.append(f"{diff} {title}")
+            titles.append(_encode_task_entry(diff, title, slug))
 
     _cache[cache_key] = (titles, now_ts)
     return titles, None
@@ -1053,7 +1108,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"🔥 {target_display}, сегодня ({today}) решено {len(titles)} задач:\n"
-        + "\n".join([f"• {t}" for t in titles])
+        + "\n".join([f"• {_format_task_entry(t)}" for t in titles])
     )
     await update.message.reply_text(msg)
 
@@ -1074,6 +1129,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = context.args[0].strip()
         nick = None
         display = target
+        target_tid = None
 
         if target.startswith("@"):
             t = target.lower()
@@ -1107,7 +1163,9 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{display} — сегодня ({today}) 0 задач ❌")
             return
 
-        msg = f"{display} — сегодня ({today}) решил {len(titles)} задач ✅:\n" + "\n".join([f"• {t}" for t in titles])
+        msg = f"{display} — сегодня ({today}) решил {len(titles)} задач ✅:\n" + "\n".join(
+            [f"• {_format_task_entry(t)}" for t in titles]
+        )
         await update.message.reply_text(msg)
         return
 
@@ -1207,7 +1265,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if titles:
                 lines.append("   └ решённые задачи:")
                 for t in titles:
-                    lines.append(f"      • {t}")
+                    lines.append(f"      • {_format_task_entry(t)}")
             else:
                 lines.append("   └ решённых задач сегодня нет.")
 
@@ -1364,6 +1422,58 @@ async def clearboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Лидерборд очищен. Новый сезон начался с сегодняшнего дня.")
 
 
+async def recalculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    recompute_leaderboard_from_daily_stats()
+    await update.message.reply_text("✅ Лидерборд пересчитан из сохранённых daily_stats.")
+
+
+async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Использование: /recheckday YYYY-MM-DD")
+        return
+
+    try:
+        target_day = datetime.strptime(context.args[0].strip(), "%Y-%m-%d").date()
+    except Exception:
+        await update.message.reply_text("Неверная дата. Формат: YYYY-MM-DD")
+        return
+
+    rows = list_users()
+    if not rows:
+        await update.message.reply_text("Пока нет зарегистрированных пользователей.")
+        return
+
+    day_str = target_day.strftime("%Y-%m-%d")
+    ok = 0
+    errors = []
+
+    for tid, uname, nick in rows:
+        titles, err = accepted_titles_on_day(nick, target_day)
+        if err:
+            errors.append(mention(uname))
+            continue
+        update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
+        ok += 1
+
+    recompute_leaderboard_from_daily_stats()
+    _cache.clear()
+
+    msg = f"✅ Перепроверил {day_str}: обновлено {ok}/{len(rows)} пользователей."
+    if errors:
+        msg += "\n⚠️ Ошибка LeetCode у: " + ", ".join(errors)
+    await update.message.reply_text(msg)
+
+
 async def _week_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
@@ -1490,7 +1600,11 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optional[date] = None):
+async def daily_report_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    target_day: Optional[date] = None,
+    apply_warns: bool = True,
+):
     chat_id = db_get_config("report_chat_id")
     if not chat_id:
         return
@@ -1503,6 +1617,8 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
 
     day = target_day or datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
+    warns_key = f"warns_applied_{day_str}"
+    should_apply_warns = apply_warns and not bool(db_get_config(warns_key))
 
     items = []  # (had_error, cnt, name)
     mvp_max = -1
@@ -1523,7 +1639,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
         # For catch-up reports (yesterday), logic is the same. We don't warn on LC errors above.
         warn_count = None
         kicked = False
-        if cnt == 0:
+        if should_apply_warns and cnt == 0:
             warn_count = inc_warn(int(tid))
             if warn_count >= 3:
                 # Kick from group (ban+unban), requires bot admin rights.
@@ -1564,7 +1680,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
             mark = "✅" if cnt >= 1 else "❌"
             if cnt == 0:
                 w = get_warn_count_by_name.get(name, None)
-                if w is None:
+                if (not should_apply_warns) or w is None:
                     # fallback: do not show
                     report_lines.append(f"{name} — {cnt} задач {mark}")
                 else:
@@ -1584,6 +1700,8 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE, target_day: Optio
     header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await context.bot.send_message(chat_id=chat_id, text=text)
+    if should_apply_warns:
+        db_set_config(warns_key, "1")
     _set_last_report_day(day_str)
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
@@ -1609,7 +1727,7 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         if not db_get_config("report_chat_id"):
             return
         logger.info("Catch-up job: generating report for %s at %s", y_str, _now_str())
-        await daily_report_job(context, target_day=y)
+        await daily_report_job(context, target_day=y, apply_warns=False)
     except Exception as e:
         logger.exception("catchup_job failed: %s", e)
 
@@ -1636,6 +1754,8 @@ def main():
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
     app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("clearboard", clearboard))
+    app.add_handler(CommandHandler("recalculate", recalculate))
+    app.add_handler(CommandHandler("recheckday", recheckday))
     app.add_handler(CommandHandler("settime", settime))  # owner-only
     app.add_handler(CommandHandler("unwarn", unwarn))  # owner-only
     app.add_handler(CommandHandler("info", info))

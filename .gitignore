@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+leetcode_bot.db
+backup.json
+.env
