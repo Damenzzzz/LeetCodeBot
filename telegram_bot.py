@@ -53,6 +53,10 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
 
 import requests
+try:
+    import psycopg
+except ImportError:
+    psycopg = None
 from telegram import Update, ChatMember
 from telegram.ext import (
     ApplicationBuilder,
@@ -62,6 +66,8 @@ from telegram.ext import (
 
 # ----------------- Config -----------------
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+USE_POSTGRES = bool(DATABASE_URL)
 DB_SCHEMA_VERSION = 3
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
@@ -90,19 +96,51 @@ _cache: Dict[Tuple[str, str], Tuple[List[str], float]] = {}
 
 
 # ----------------- DB helpers -----------------
-def init_db():
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
+def db_connect():
+    if USE_POSTGRES:
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set, but psycopg is not installed")
+        return psycopg.connect(DATABASE_URL)
+    return sqlite3.connect(DB_PATH)
 
-    conn = sqlite3.connect(DB_PATH)
+
+def db_execute(cur, sql: str, params: Tuple[Any, ...] = ()):
+    if USE_POSTGRES:
+        sql = sql.replace("?", "%s")
+    return cur.execute(sql, params)
+
+
+def _upsert_sql(table: str, columns: List[str], conflict_columns: List[str]) -> str:
+    columns_sql = ", ".join(columns)
+    placeholders = ", ".join("?" for _ in columns)
+    conflict_sql = ", ".join(conflict_columns)
+
+    if USE_POSTGRES:
+        updates = ", ".join(f"{col}=EXCLUDED.{col}" for col in columns if col not in conflict_columns)
+        if not updates:
+            updates = f"{conflict_columns[0]}=EXCLUDED.{conflict_columns[0]}"
+        return (
+            f"INSERT INTO {table}({columns_sql}) VALUES({placeholders}) "
+            f"ON CONFLICT({conflict_sql}) DO UPDATE SET {updates}"
+        )
+
+    return f"REPLACE INTO {table}({columns_sql}) VALUES({placeholders})"
+
+
+def init_db():
+    if not USE_POSTGRES:
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
+
+    conn = db_connect()
     cur = conn.cursor()
 
     # users: keep minimal columns; if older table has more columns, it's fine.
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             username TEXT,
             leetcode_nick TEXT
         )
@@ -123,7 +161,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS daily_stats (
             day TEXT,
-            telegram_id INTEGER,
+            telegram_id BIGINT,
             solved_count INTEGER,
             titles_json TEXT,
             PRIMARY KEY(day, telegram_id)
@@ -135,7 +173,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS leaderboard (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             points INTEGER
         )
         """
@@ -145,7 +183,7 @@ def init_db():
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS warns (
-            telegram_id INTEGER PRIMARY KEY,
+            telegram_id BIGINT PRIMARY KEY,
             count INTEGER
         )
         """
@@ -182,12 +220,12 @@ def ensure_db_schema():
 
     # v2: leaderboard table (telegram_id -> points)
     if current < 2:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cur = conn.cursor()
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS leaderboard (
-                telegram_id INTEGER PRIMARY KEY,
+                telegram_id BIGINT PRIMARY KEY,
                 points INTEGER
             )
             """
@@ -199,12 +237,12 @@ def ensure_db_schema():
 
     # v3: warns table (telegram_id -> warn count)
     if current < 3:
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cur = conn.cursor()
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS warns (
-                telegram_id INTEGER PRIMARY KEY,
+                telegram_id BIGINT PRIMARY KEY,
                 count INTEGER
             )
             """
@@ -216,35 +254,36 @@ def ensure_db_schema():
 
 
 def db_set_config(key: str, value: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", (key, value))
+    db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), (key, value))
     conn.commit()
     conn.close()
 
 
 def db_get_config(key: str) -> Optional[str]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM config WHERE key=?", (key,))
+    db_execute(cur, "SELECT value FROM config WHERE key=?", (key,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else None
 
 
 def db_delete_config(key: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM config WHERE key=?", (key,))
+    db_execute(cur, "DELETE FROM config WHERE key=?", (key,))
     conn.commit()
     conn.close()
 
 
 def add_user(tid: int, username: str, nick: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute(
-        "REPLACE INTO users(telegram_id, username, leetcode_nick) VALUES(?,?,?)",
+    db_execute(
+        cur,
+        _upsert_sql("users", ["telegram_id", "username", "leetcode_nick"], ["telegram_id"]),
         (tid, username, nick),
     )
     conn.commit()
@@ -252,15 +291,15 @@ def add_user(tid: int, username: str, nick: str):
 
 
 def remove_user(tid: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE telegram_id=?", (tid,))
+    db_execute(cur, "DELETE FROM users WHERE telegram_id=?", (tid,))
     conn.commit()
     conn.close()
 
 
 def list_users():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
     rows = cur.fetchall()
@@ -269,10 +308,11 @@ def list_users():
 
 
 def save_daily_stats(day: str, tid: int, solved_count: int, titles: List[str]):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute(
-        "REPLACE INTO daily_stats(day, telegram_id, solved_count, titles_json) VALUES(?,?,?,?)",
+    db_execute(
+        cur,
+        _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
         (day, tid, int(solved_count), json.dumps(titles, ensure_ascii=False)),
     )
     conn.commit()
@@ -304,12 +344,12 @@ def _get_leaderboard_reset_day() -> str:
 def recompute_leaderboard_from_daily_stats():
     reset_day = _get_leaderboard_reset_day()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("DELETE FROM leaderboard")
 
     if reset_day:
-        cur.execute("SELECT telegram_id, titles_json FROM daily_stats WHERE day >= ?", (reset_day,))
+        db_execute(cur, "SELECT telegram_id, titles_json FROM daily_stats WHERE day >= ?", (reset_day,))
     else:
         cur.execute("SELECT telegram_id, titles_json FROM daily_stats")
     rows = cur.fetchall()
@@ -323,14 +363,14 @@ def recompute_leaderboard_from_daily_stats():
         totals[int(tid)] = totals.get(int(tid), 0) + points_from_titles(titles)
 
     for tid, pts in totals.items():
-        cur.execute("REPLACE INTO leaderboard(telegram_id, points) VALUES(?,?)", (int(tid), int(pts)))
+        db_execute(cur, _upsert_sql("leaderboard", ["telegram_id", "points"], ["telegram_id"]), (int(tid), int(pts)))
 
     conn.commit()
     conn.close()
 
 
 def get_leaderboard_points() -> Dict[int, int]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT telegram_id, points FROM leaderboard")
     rows = cur.fetchall()
@@ -340,18 +380,18 @@ def get_leaderboard_points() -> Dict[int, int]:
 
 # ----------------- Warn system helpers -----------------
 def get_warn_count(tid: int) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT count FROM warns WHERE telegram_id=?", (int(tid),))
+    db_execute(cur, "SELECT count FROM warns WHERE telegram_id=?", (int(tid),))
     row = cur.fetchone()
     conn.close()
     return int(row[0] or 0) if row else 0
 
 
 def set_warn_count(tid: int, count: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("REPLACE INTO warns(telegram_id, count) VALUES(?,?)", (int(tid), int(count)))
+    db_execute(cur, _upsert_sql("warns", ["telegram_id", "count"], ["telegram_id"]), (int(tid), int(count)))
     conn.commit()
     conn.close()
 
@@ -364,15 +404,15 @@ def inc_warn(tid: int) -> int:
 
 
 def clear_warns(tid: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("DELETE FROM warns WHERE telegram_id=?", (int(tid),))
+    db_execute(cur, "DELETE FROM warns WHERE telegram_id=?", (int(tid),))
     conn.commit()
     conn.close()
 
 
 def clear_all_warns():
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
     cur.execute("DELETE FROM warns")
     conn.commit()
@@ -388,7 +428,7 @@ def _backup_dir() -> str:
 
 
 def collect_backup_data() -> Dict[str, Any]:
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
 
     cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
@@ -568,10 +608,10 @@ def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, t
     reset_day = _get_leaderboard_reset_day()
     count_for_leaderboard = (not reset_day) or (day_str >= reset_day)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
 
-    cur.execute("SELECT titles_json FROM daily_stats WHERE day=? AND telegram_id=?", (day_str, int(tid)))
+    db_execute(cur, "SELECT titles_json FROM daily_stats WHERE day=? AND telegram_id=?", (day_str, int(tid)))
     row = cur.fetchone()
     try:
         old_titles = json.loads(row[0]) if row and row[0] else []
@@ -587,28 +627,37 @@ def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, t
     delta = new_pts - old_pts
 
     if count_for_leaderboard and delta > 0:
-        cur.execute(
-            "INSERT INTO leaderboard(telegram_id, points) VALUES(?, ?) "
-            "ON CONFLICT(telegram_id) DO UPDATE SET points = points + ?",
-            (int(tid), int(delta), int(delta)),
-        )
+        if USE_POSTGRES:
+            db_execute(
+                cur,
+                "INSERT INTO leaderboard(telegram_id, points) VALUES(?, ?) "
+                "ON CONFLICT(telegram_id) DO UPDATE SET points = leaderboard.points + EXCLUDED.points",
+                (int(tid), int(delta)),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO leaderboard(telegram_id, points) VALUES(?, ?) "
+                "ON CONFLICT(telegram_id) DO UPDATE SET points = points + ?",
+                (int(tid), int(delta), int(delta)),
+            )
 
     # keep solved_count consistent with merged titles
     solved_count_final = max(int(solved_count or 0), len(merged_titles))
 
-    cur.execute(
-        "REPLACE INTO daily_stats(day, telegram_id, solved_count, titles_json) VALUES(?,?,?,?)",
+    db_execute(
+        cur,
+        _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
         (day_str, int(tid), int(solved_count_final), json.dumps(merged_titles, ensure_ascii=False)),
     )
 
     conn.commit()
     conn.close()
 def clear_leaderboard_and_season_from(day_str: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
-    cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", ("leaderboard_reset_day", str(day_str)))
+    db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), ("leaderboard_reset_day", str(day_str)))
     cur.execute("DELETE FROM leaderboard")
-    cur.execute("DELETE FROM daily_stats WHERE day >= ?", (str(day_str),))
+    db_execute(cur, "DELETE FROM daily_stats WHERE day >= ?", (str(day_str),))
     conn.commit()
     conn.close()
 
@@ -618,10 +667,11 @@ def get_week_stats(days: List[str]):
     """
     Returns dict: tid -> {day -> solved_count}
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = db_connect()
     cur = conn.cursor()
     placeholders = ",".join("?" for _ in days)
-    cur.execute(
+    db_execute(
+        cur,
         f"SELECT day, telegram_id, solved_count FROM daily_stats WHERE day IN ({placeholders})",
         tuple(days),
     )
@@ -937,7 +987,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Make sure schema exists
         init_db()
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = db_connect()
         cur = conn.cursor()
 
         # Clear existing data
@@ -951,16 +1001,16 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if config_rows:
             if isinstance(config_rows, dict):
                 for k, v in config_rows.items():
-                    cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", (str(k), str(v)))
+                    db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), (str(k), str(v)))
             else:
                 for row in config_rows:
                     k = row.get("key")
                     v = row.get("value")
                     if k is not None and v is not None:
-                        cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", (str(k), str(v)))
+                        db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), (str(k), str(v)))
 
         # Record schema version
-        cur.execute("REPLACE INTO config(key,value) VALUES(?,?)", ("db_schema_version", str(schema_version)))
+        db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), ("db_schema_version", str(schema_version)))
 
         # Restore users
         users_count = 0
@@ -971,8 +1021,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 nick = row.get("leetcode_nick") or row.get("nick") or row.get("leetcode") or ""
                 if tid is None or not nick:
                     continue
-                cur.execute(
-                    "REPLACE INTO users(telegram_id, username, leetcode_nick) VALUES(?,?,?)",
+                db_execute(
+                    cur,
+                    _upsert_sql("users", ["telegram_id", "username", "leetcode_nick"], ["telegram_id"]),
                     (int(tid), str(uname), str(nick)),
                 )
                 users_count += 1
@@ -990,8 +1041,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     titles_json = json.dumps(titles, ensure_ascii=False)
                 if day is None or tid is None:
                     continue
-                cur.execute(
-                    "REPLACE INTO daily_stats(day, telegram_id, solved_count, titles_json) VALUES(?,?,?,?)",
+                db_execute(
+                    cur,
+                    _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
                     (str(day), int(tid), int(cnt), titles_json or "[]"),
                 )
                 stats_count += 1
@@ -1006,8 +1058,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pts = row.get("points") or row.get("score") or 0
                     if tid is None:
                         continue
-                    cur.execute(
-                        "REPLACE INTO leaderboard(telegram_id, points) VALUES(?,?)",
+                    db_execute(
+                        cur,
+                        _upsert_sql("leaderboard", ["telegram_id", "points"], ["telegram_id"]),
                         (int(tid), int(pts)),
                     )
                 restored_lb = True
@@ -1021,8 +1074,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c = row.get("count") or row.get("warns") or 0
                 if tid is None:
                     continue
-                cur.execute(
-                    "REPLACE INTO warns(telegram_id, count) VALUES(?,?)",
+                db_execute(
+                    cur,
+                    _upsert_sql("warns", ["telegram_id", "count"], ["telegram_id"]),
                     (int(tid), int(c)),
                 )
 

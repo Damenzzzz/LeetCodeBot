@@ -14,6 +14,7 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 - Daily report marks who solved at least one problem and applies warnings.
 - Users with 3 warnings are removed from the configured group, if the bot has admin rights.
 - `/backup` and `/restore` help move the bot between servers.
+- If `DATABASE_URL` is set, the bot stores data in Postgres; otherwise it falls back to local SQLite.
 
 ## Why scoring is more reliable now
 
@@ -50,5 +51,7 @@ python telegram_bot.py
 ## Hosting Notes
 
 This bot uses polling, so it does not need a public HTTPS webhook URL. It can run on a VPS, Oracle Cloud Always Free, Railway, Render, Fly.io, or any always-on machine.
+
+On Railway, attach a Postgres database to the bot service and expose its `DATABASE_URL` variable. This keeps users, daily stats, warnings, and leaderboard data outside the app container, so redeploys do not wipe the bot state.
 
 For free hosting, Oracle Cloud Always Free is usually the most stable long-term option, but setup is more manual. A small paid VPS is simpler and more predictable.
