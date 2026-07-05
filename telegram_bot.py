@@ -225,6 +225,14 @@ def db_get_config(key: str) -> Optional[str]:
     return row[0] if row else None
 
 
+def db_delete_config(key: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM config WHERE key=?", (key,))
+    conn.commit()
+    conn.close()
+
+
 def add_user(tid: int, username: str, nick: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -1051,6 +1059,17 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📌 Ок! Эта группа теперь получает напоминания/отчёты.")
 
 
+async def cleargroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    db_delete_config("report_chat_id")
+    db_delete_config("report_message_thread_id")
+    await update.message.reply_text("✅ Авто-напоминания и ежедневные отчёты отключены. Чтобы включить снова, напиши /setgroup в нужном топике.")
+
+
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
@@ -1737,7 +1756,7 @@ async def daily_report_job(
     _set_last_report_day(day_str)
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Админ-команды:*\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -1779,6 +1798,7 @@ def main():
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("unregister", unregister))
     app.add_handler(CommandHandler("setgroup", setgroup))
+    app.add_handler(CommandHandler("cleargroup", cleargroup))
     app.add_handler(CommandHandler("list", listcmd))
     app.add_handler(CommandHandler("check", check))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
