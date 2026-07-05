@@ -50,7 +50,7 @@ import sqlite3
 import logging
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Any
 
 import requests
 from telegram import Update, ChatMember
@@ -67,6 +67,9 @@ LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
 TASK_SLUG_SEP = "||"
+AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").lower() not in ("0", "false", "no", "off")
+AUTO_BACKUP_SEND_TO_OWNER = os.getenv("AUTO_BACKUP_SEND_TO_OWNER", "1").lower() not in ("0", "false", "no", "off")
+AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "20"))
 
 DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
 DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "58"))
@@ -88,6 +91,10 @@ _cache: Dict[Tuple[str, str], Tuple[List[str], float]] = {}
 
 # ----------------- DB helpers -----------------
 def init_db():
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
+
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
@@ -370,6 +377,106 @@ def clear_all_warns():
     cur.execute("DELETE FROM warns")
     conn.commit()
     conn.close()
+
+
+def _backup_dir() -> str:
+    custom_dir = os.getenv("BACKUP_DIR", "").strip()
+    if custom_dir:
+        return custom_dir
+    base_dir = os.path.dirname(DB_PATH) or "."
+    return os.path.join(base_dir, "backups")
+
+
+def collect_backup_data() -> Dict[str, Any]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
+    users_rows = [
+        {"telegram_id": int(tid), "username": str(uname or ""), "leetcode_nick": str(nick or "")}
+        for tid, uname, nick in cur.fetchall()
+    ]
+
+    cur.execute("SELECT day, telegram_id, solved_count, titles_json FROM daily_stats")
+    stats_rows = []
+    for day, tid, cnt, titles_json in cur.fetchall():
+        stats_rows.append(
+            {"day": str(day), "telegram_id": int(tid), "solved_count": int(cnt or 0), "titles_json": titles_json or "[]"}
+        )
+
+    cur.execute("SELECT key, value FROM config")
+    config_rows = {str(k): str(v) for k, v in cur.fetchall()}
+
+    cur.execute("SELECT telegram_id, points FROM leaderboard")
+    leaderboard_rows = [{"telegram_id": int(tid), "points": int(pts or 0)} for tid, pts in cur.fetchall()]
+
+    cur.execute("SELECT telegram_id, count FROM warns")
+    warns_rows = [{"telegram_id": int(tid), "count": int(c or 0)} for tid, c in cur.fetchall()]
+
+    conn.close()
+
+    return {
+        "schema_version": DB_SCHEMA_VERSION,
+        "exported_at": _now_str(),
+        "tables": {
+            "users": users_rows,
+            "daily_stats": stats_rows,
+            "config": config_rows,
+            "leaderboard": leaderboard_rows,
+            "warns": warns_rows,
+        },
+    }
+
+
+def write_backup_file(reason: str = "manual") -> str:
+    out_dir = _backup_dir()
+    os.makedirs(out_dir, exist_ok=True)
+    data = collect_backup_data()
+    data["reason"] = reason
+
+    stamp = datetime.now(TZ).strftime("%Y%m%d_%H%M%S")
+    safe_reason = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in reason)[:40] or "backup"
+    out_path = os.path.join(out_dir, f"backup_{stamp}_{safe_reason}.json")
+    latest_path = os.path.join(out_dir, "backup_latest.json")
+
+    for path in (out_path, latest_path):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    try:
+        backups = sorted(
+            [
+                os.path.join(out_dir, name)
+                for name in os.listdir(out_dir)
+                if name.startswith("backup_") and name.endswith(".json") and name != "backup_latest.json"
+            ],
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for old_path in backups[max(AUTO_BACKUP_KEEP, 1):]:
+            os.remove(old_path)
+    except Exception as e:
+        logger.warning("Backup cleanup failed: %s", e)
+
+    return out_path
+
+
+async def auto_backup(context: ContextTypes.DEFAULT_TYPE, reason: str):
+    if not AUTO_BACKUP_ENABLED:
+        return
+    try:
+        path = write_backup_file(reason)
+        logger.info("Auto backup saved: %s", path)
+        if AUTO_BACKUP_SEND_TO_OWNER and OWNER_ID:
+            with open(path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=OWNER_ID,
+                    document=f,
+                    filename=os.path.basename(path),
+                    caption=f"🧳 Auto-backup: {reason}",
+                )
+    except Exception as e:
+        logger.exception("Auto backup failed (%s): %s", reason, e)
 
 def _parse_task_entry(s: str) -> Tuple[str, str, str]:
     """Parse stored task entry into (difficulty, title, titleSlug). Backward-compatible with old rows."""
@@ -753,49 +860,7 @@ async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🧳 Собираю бэкап в JSON… ща прилетит 📦")
 
     try:
-        conn = sqlite3.connect(DB_PATH)
-        cur = conn.cursor()
-
-        cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
-        users_rows = [
-            {"telegram_id": int(tid), "username": str(uname or ""), "leetcode_nick": str(nick or "")}
-            for tid, uname, nick in cur.fetchall()
-        ]
-
-        cur.execute("SELECT day, telegram_id, solved_count, titles_json FROM daily_stats")
-        stats_rows = []
-        for day, tid, cnt, titles_json in cur.fetchall():
-            stats_rows.append(
-                {"day": str(day), "telegram_id": int(tid), "solved_count": int(cnt or 0), "titles_json": titles_json or "[]"}
-            )
-
-        cur.execute("SELECT key, value FROM config")
-        config_rows = {str(k): str(v) for k, v in cur.fetchall()}
-
-        cur.execute("SELECT telegram_id, points FROM leaderboard")
-        leaderboard_rows = [{"telegram_id": int(tid), "points": int(pts or 0)} for tid, pts in cur.fetchall()]
-
-        cur.execute("SELECT telegram_id, count FROM warns")
-        warns_rows = [{"telegram_id": int(tid), "count": int(c or 0)} for tid, c in cur.fetchall()]
-
-        conn.close()
-
-        data = {
-            "schema_version": DB_SCHEMA_VERSION,
-            "exported_at": _now_str(),
-            "tables": {
-                "users": users_rows,
-                "daily_stats": stats_rows,
-                "config": config_rows,
-                "leaderboard": leaderboard_rows,
-                "warns": warns_rows,
-            },
-        }
-
-        out_path = os.path.join(os.path.dirname(DB_PATH) or ".", "backup.json")
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
+        out_path = write_backup_file("manual")
         with open(out_path, "rb") as f:
             await update.message.reply_document(document=f, filename="backup.json", caption="✅ Вот JSON-бэкап (включая лидерборд).")
 
@@ -975,6 +1040,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• daily_stats: {stats_count}"
             "Можно продолжать: /list, /leaderboard."
         )
+        await auto_backup(context, "restore")
     except Exception as e:
         logger.exception("Restore failed: %s", e)
         await update.message.reply_text(f"❌ Restore упал: {e}")
@@ -1006,6 +1072,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     nick = context.args[0].strip()
     add_user(user.id, user.username or user.full_name, nick)
+    await auto_backup(context, "register")
 
     # сброс кеша на сегодня для нового ника, чтобы /list сразу показал актуально
     today_key = datetime.now(TZ).strftime("%Y-%m-%d")
@@ -1032,6 +1099,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def unregister(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     remove_user(update.effective_user.id)
+    await auto_backup(context, "unregister")
     await update.message.reply_text("🫡 Удалил. Но я верю, ты вернёшься сильнее.")
 
 
@@ -1053,9 +1121,11 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = getattr(msg, "message_thread_id", None)
     if thread_id is not None:
         db_set_config("report_message_thread_id", str(thread_id))
+        await auto_backup(context, "setgroup")
         await update.message.reply_text("📌 Ок! Напоминания/отчёты будут приходить в этот топик.")
     else:
         db_set_config("report_message_thread_id", "")
+        await auto_backup(context, "setgroup")
         await update.message.reply_text("📌 Ок! Эта группа теперь получает напоминания/отчёты.")
 
 
@@ -1067,6 +1137,7 @@ async def cleargroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_delete_config("report_chat_id")
     db_delete_config("report_message_thread_id")
+    await auto_backup(context, "cleargroup")
     await update.message.reply_text("✅ Авто-напоминания и ежедневные отчёты отключены. Чтобы включить снова, напиши /setgroup в нужном топике.")
 
 
@@ -1353,6 +1424,7 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     remove_user(target_tid)
     recompute_leaderboard_from_daily_stats()
+    await auto_backup(context, "removeuser")
     await update.message.reply_text(f"✅ Удалил {target_uname} из бота.")
 
 
@@ -1399,6 +1471,7 @@ async def settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db_set_config("daily_hour", str(hh))
     db_set_config("daily_minute", str(mm))
+    await auto_backup(context, "settime")
 
     # reschedule daily job (name-based)
     try:
@@ -1429,6 +1502,7 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = context.args[0].strip()
     if target.lower() in ("all", "все", "everyone"):
         clear_all_warns()
+        await auto_backup(context, "unwarn_all")
         await update.message.reply_text("✅ Предупреждения сброшены для всех участников.")
         return
 
@@ -1456,6 +1530,7 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     clear_warns(target_tid)
+    await auto_backup(context, "unwarn_user")
     await update.message.reply_text(f"✅ Предупреждения сброшены для {target_name}.")
 
 async def clearboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1468,6 +1543,7 @@ async def clearboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day_str = datetime.now(TZ).date().strftime("%Y-%m-%d")
     clear_leaderboard_and_season_from(day_str)
     _cache.clear()
+    await auto_backup(context, "clearboard")
     await update.message.reply_text("✅ Лидерборд очищен. Новый сезон начался с сегодняшнего дня.")
 
 
@@ -1478,6 +1554,7 @@ async def recalculate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     recompute_leaderboard_from_daily_stats()
+    await auto_backup(context, "recalculate")
     await update.message.reply_text("✅ Лидерборд пересчитан из сохранённых daily_stats.")
 
 
@@ -1520,6 +1597,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"✅ Перепроверил {day_str}: обновлено {ok}/{len(rows)} пользователей."
     if errors:
         msg += "\n⚠️ Ошибка LeetCode у: " + ", ".join(errors)
+    await auto_backup(context, "recheckday")
     await update.message.reply_text(msg)
 
 
@@ -1772,6 +1850,7 @@ async def daily_report_job(
     if should_apply_warns:
         db_set_config(warns_key, "1")
     _set_last_report_day(day_str)
+    await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
