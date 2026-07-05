@@ -966,7 +966,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /check — твои задачи сегодня\n"
         "• /list — статус всех сегодня\n"
         "• /list @user — задачи пользователя сегодня\n"
-        "• /link @user — ссылка на LeetCode аккаунт\n"
         "• /week — статистика за 7 дней\n"
         "• /setgroup — (админ) куда слать напоминания\n"
         "• /info — полная информация по боту и командам\n\n"
@@ -1314,35 +1313,17 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Удалил {target_uname} из бота.")
 
 
-def _normalize_telegram_lookup(raw: str) -> str:
-    target = (raw or "").strip().lower()
-    if target.startswith("@"):
-        target = target[1:]
-    return target
-
-
-def _matches_telegram_user(stored_username: str, target: str) -> bool:
-    normalized = _normalize_telegram_lookup(target)
-    candidates = {
-        _normalize_telegram_lookup(stored_username or ""),
-        _normalize_telegram_lookup(mention(stored_username or "")),
-    }
-    return normalized in candidates
-
-
-async def leetcode_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    if len(context.args) != 1:
-        await update.message.reply_text("Использование: /link @username")
+    if len(context.args) != 1 or not context.args[0].strip().startswith("@"):
+        await update.message.reply_text("Использование: /who @username")
         return
 
-    target = context.args[0].strip()
+    target = context.args[0].strip().lower()
     rows = list_users()
     for _tid, uname, nick in rows:
-        if _matches_telegram_user(uname, target):
-            await update.message.reply_text(
-                f"{mention(uname)} → https://leetcode.com/u/{nick}/"
-            )
+        if mention(uname).lower() == target:
+            await update.message.reply_text(f"{mention(uname)} → https://leetcode.com/u/{nick}/")
             return
 
     await update.message.reply_text("Не нашёл пользователя в базе. Пусть он сделает /register <nick>.")
@@ -1726,7 +1707,7 @@ async def daily_report_job(
     _set_last_report_day(day_str)
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /link @user — ссылка на LeetCode аккаунт пользователя\n • /leaderboard — рейтинг по баллам\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /week — статистика за последние 7 дней\n • /week @user — статистика за 7 дней для конкретного пользователя\n • /info — эта справка\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -1773,9 +1754,7 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("listtask", listtask))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
-    app.add_handler(CommandHandler("who", leetcode_link))
-    app.add_handler(CommandHandler("link", leetcode_link))
-    app.add_handler(CommandHandler("leetcode", leetcode_link))
+    app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("clearboard", clearboard))
     app.add_handler(CommandHandler("recalculate", recalculate))
     app.add_handler(CommandHandler("recheckday", recheckday))

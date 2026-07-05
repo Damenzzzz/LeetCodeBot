@@ -4,6 +4,3 @@ __pycache__/
 leetcode_bot.db
 backup.json
 .env
-bot.log
-bot.pid
-logs/
