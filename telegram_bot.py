@@ -48,6 +48,7 @@ import os
 import json
 import sqlite3
 import logging
+import html
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
@@ -817,6 +818,14 @@ def mention(uname: str) -> str:
     return uname or "unknown"
 
 
+def profile_label(uname: str) -> str:
+    raw = (uname or "unknown").strip() or "unknown"
+    username = raw[1:] if raw.startswith("@") else raw
+    if username and " " not in username and username != "unknown":
+        return f'<a href="https://t.me/{html.escape(username, quote=True)}">{html.escape(username)}</a>'
+    return html.escape(raw)
+
+
 def _now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1384,7 +1393,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, nick in rows:
         titles, err = accepted_titles_today(nick)
         if err:
-            errors.append(mention(uname))
+            errors.append(profile_label(uname))
             continue
         try:
             update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
@@ -1394,13 +1403,14 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     points_map = get_leaderboard_points()
     entries = []
     for tid, uname, _nick in rows:
-        entries.append((int(points_map.get(int(tid), 0)), mention(uname)))
+        name = profile_label(uname)
+        entries.append((int(points_map.get(int(tid), 0)), name, (uname or "").lower()))
 
-    entries.sort(key=lambda x: (-x[0], x[1].lower()))
+    entries.sort(key=lambda x: (-x[0], x[2]))
     top_pts = entries[0][0] if entries else 0
 
     lines = []
-    for pts, name in entries:
+    for pts, name, _sort_name in entries:
         trophy = " 🥇" if pts == top_pts and pts > 0 else ""
         lines.append(f"{name}: {pts} балл(ов){trophy}")
 
@@ -1408,7 +1418,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = header + "\n".join(lines)
     if errors:
         text += "\n\n⚠️ Не смог обновить сейчас: " + ", ".join(errors)
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
