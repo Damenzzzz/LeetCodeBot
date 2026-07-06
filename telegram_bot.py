@@ -13,7 +13,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 - /backup                     — (админ) прислать файл базы (регистрации/статистика) для переноса
 
 Авто-уведомления:
-- каждые 3 часа: пингует тех, кто сегодня ещё не решил ни 1 задачу (с упоминаниями)
+- в 18:00 и 23:00: пингует тех, кто сегодня ещё не решил ни 1 задачу (с упоминаниями)
 - как только ВСЕ решили ≥1 задачу (проверяется в цикле напоминаний): пишет поздравление 1 раз в день
 - ежедневный отчёт в конце дня: показывает итоговый статус + MVP дня (кто решил больше всех) и сохраняет статистику в БД
 
@@ -23,7 +23,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 
 Env:
 - TELEGRAM_TOKEN (обязательно)
-- DAILY_HOUR / DAILY_MINUTE (по умолчанию 23:59 Asia/Almaty)
+- DAILY_HOUR / DAILY_MINUTE (по умолчанию 00:00 Asia/Almaty)
 
 
 добавь функцию remove
@@ -78,10 +78,10 @@ AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").lower() not in ("0",
 AUTO_BACKUP_SEND_TO_OWNER = os.getenv("AUTO_BACKUP_SEND_TO_OWNER", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "20"))
 
-DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
-DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "58"))
+DAILY_HOUR = int(os.getenv("DAILY_HOUR", "0"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
 
-REMINDER_INTERVAL_SECONDS = 5 * 60 * 60  # 5 hours
+REMINDER_HOURS = (18, 23)
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
@@ -826,6 +826,11 @@ def profile_label(uname: str) -> str:
     return html.escape(raw)
 
 
+def display_name(uname: str) -> str:
+    raw = (uname or "unknown").strip() or "unknown"
+    return raw[1:] if raw.startswith("@") else raw
+
+
 def _now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1223,7 +1228,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    target_display = mention(user.username or user.full_name)
+    target_display = display_name(user.username or user.full_name)
     nick = None
 
     # With argument: /check @user or /check <leetcodeNick>
@@ -1234,7 +1239,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for _, uname, lnick in rows:
                 if mention(uname).lower() == t:
                     nick = lnick
-                    target_display = mention(uname)
+                    target_display = display_name(uname)
                     break
         else:
             # allow direct leetcode nick
@@ -1320,7 +1325,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for tid, uname, lnick in rows:
                 if (mention(uname)).lower() == t:
                     nick = lnick
-                    display = mention(uname)
+                    display = display_name(uname)
                     target_tid = int(tid)
                     break
         else:
@@ -1332,6 +1337,11 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         titles, err = accepted_titles_today(nick)
         today = datetime.now(TZ).strftime("%Y-%m-%d")
+        if not target.startswith("@"):
+            for _tid, uname, lnick in rows:
+                if str(lnick).lower() == str(nick).lower():
+                    display = display_name(uname)
+                    break
         if err:
             await update.message.reply_text(f"⚠️ Ошибка при проверке {display}: {err}")
             return
@@ -1361,7 +1371,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, nick in rows:
         titles, err = accepted_titles_today(nick)
         if err:
-            name = mention(uname)
+            name = display_name(uname)
             scored.append((-1, name, f"{name} — ❓ ошибка проверки", True))
             continue
 
@@ -1371,7 +1381,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         mark = "✅" if cnt >= 1 else "❌"
-        name = mention(uname)
+        name = display_name(uname)
         scored.append((cnt, name, f"{name} — {cnt} задач {mark}", False))
 
     # Sort: more solved -> top; zeros -> bottom; errors -> very bottom
@@ -1433,6 +1443,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = context.args[0].strip().lower()
+    target_display = target[1:] if target.startswith("@") else target
     day = datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
 
@@ -1441,7 +1452,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
-        name = mention(uname)
+        name = display_name(uname)
         if err:
             items.append((True, -1, name, []))
             continue
@@ -1461,7 +1472,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         lines.append(line)
         name_only = line.split(" — ", 1)[0].strip().lower()
-        if name_only == target:
+        if name_only == target_display:
             if titles:
                 lines.append("   └ решённые задачи:")
                 for t in titles:
@@ -1493,13 +1504,13 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for tid, uname, _ in rows:
             if mention(uname).lower() == t:
                 target_tid = int(tid)
-                target_uname = mention(uname)
+                target_uname = display_name(uname)
                 break
     else:
         for tid, uname, lnick in rows:
             if str(lnick).lower() == target.lower():
                 target_tid = int(tid)
-                target_uname = mention(uname)
+                target_uname = display_name(uname)
                 break
 
     if target_tid is None:
@@ -1522,7 +1533,7 @@ async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_users()
     for _tid, uname, nick in rows:
         if mention(uname).lower() == target:
-            await update.message.reply_text(f"{mention(uname)} → https://leetcode.com/u/{nick}/")
+            await update.message.reply_text(f"{display_name(uname)} → https://leetcode.com/u/{nick}/")
             return
 
     await update.message.reply_text("Не нашёл пользователя в базе. Пусть он сделает /register <nick>.")
@@ -1600,13 +1611,13 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for tid, uname, _ in rows:
             if mention(uname).lower() == t:
                 target_tid = int(tid)
-                target_name = mention(uname)
+                target_name = display_name(uname)
                 break
     else:
         for tid, uname, nick in rows:
             if str(nick).lower() == target.lower():
                 target_tid = int(tid)
-                target_name = mention(uname)
+                target_name = display_name(uname)
                 break
 
     if target_tid is None:
@@ -1670,7 +1681,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, target_day)
         if err:
-            errors.append(mention(uname))
+            errors.append(display_name(uname))
             continue
         update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
         ok += 1
@@ -1725,14 +1736,14 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for tid, uname, _ in rows:
                 if mention(uname).lower() == t:
                     target_tid = int(tid)
-                    target_uname = mention(uname)
+                    target_uname = display_name(uname)
                     break
         else:
             # allow by LeetCode nick
             for tid, uname, nick in rows:
                 if nick.lower() == target.lower():
                     target_tid = int(tid)
-                    target_uname = mention(uname)
+                    target_uname = display_name(uname)
                     break
 
         if target_tid is None:
@@ -1757,7 +1768,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, _ in rows:
         per_day = week_map.get(int(tid), {})
         total = sum(per_day.get(d, 0) for d in days)
-        scores.append((total, mention(uname)))
+        scores.append((total, display_name(uname)))
 
     scores.sort(key=lambda x: (-x[0], x[1].lower()))
     for total, uname in scores:
@@ -1771,7 +1782,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Reminder tick at %s", _now_str())
     """
-    Every 3 hours:
+    At 18:00 and 23:00:
     - ping those who have 0 accepted today (with mentions)
     - if everyone has >=1, send celebration once per day
     """
@@ -1851,16 +1862,17 @@ async def daily_report_job(
     warns_key = f"warns_applied_{day_str}"
     should_apply_warns = apply_warns and not bool(db_get_config(warns_key))
 
-    items = []  # (had_error, cnt, name)
+    items = []  # (had_error, cnt, display_name, tagged_name, warn_count)
     mvp_max = -1
     mvp_winners: List[str] = []
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
-        name = mention(uname)
+        name = display_name(uname)
+        tagged_name = mention(uname)
 
         if err:
-            items.append((True, -1, name))
+            items.append((True, -1, name, tagged_name, None))
             continue
 
         titles = titles or []
@@ -1879,46 +1891,36 @@ async def daily_report_job(
                     await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(tid))
                     kicked = True
                 except Exception as e:
-                    logger.warning("Kick failed for %s (%s): %s", name, tid, e)
+                    logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
 
         update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
 
-        items.append((False, cnt, name))
+        items.append((False, cnt, name, tagged_name, warn_count))
 
         if cnt > mvp_max:
             mvp_max = cnt
-            mvp_winners = [name]
+            mvp_winners = [tagged_name]
         elif cnt == mvp_max and cnt > 0:
-            mvp_winners.append(name)
+            mvp_winners.append(tagged_name)
 
     items.sort(key=lambda x: (x[0], -x[1], x[2].lower()))
 
-    # Build a map name -> warn_count for display (warns are tracked by telegram_id; name is stable in this report)
-    # We only show warn counts for users who have 0 solved and no LC error.
-    get_warn_count_by_name: Dict[str, int] = {}
-    try:
-        for tid, uname, _nick in rows:
-            nm = mention(uname)
-            get_warn_count_by_name[nm] = get_warn_count(int(tid))
-    except Exception:
-        get_warn_count_by_name = {}
-
     report_lines = []
-    for had_error, cnt, name in items:
+    for had_error, cnt, name, tagged_name, warn_count in items:
         if had_error:
             report_lines.append(f"{name} — ❓ ошибка проверки (LeetCode недоступен)")
         else:
             mark = "✅" if cnt >= 1 else "❌"
             if cnt == 0:
-                w = get_warn_count_by_name.get(name, None)
-                if (not should_apply_warns) or w is None:
+                report_name = tagged_name
+                if (not should_apply_warns) or warn_count is None:
                     # fallback: do not show
-                    report_lines.append(f"{name} — {cnt} задач {mark}")
+                    report_lines.append(f"{report_name} — {cnt} задач {mark}")
                 else:
-                    suffix = f" ⚠️ warn {w}/3"
-                    if w >= 3:
+                    suffix = f" ⚠️ warn {warn_count}/3"
+                    if warn_count >= 3:
                         suffix += " ❌ KICK"
-                    report_lines.append(f"{name} — {cnt} задач {mark}{suffix}")
+                    report_lines.append(f"{report_name} — {cnt} задач {mark}{suffix}")
             else:
                 report_lines.append(f"{name} — {cnt} задач {mark}")
 
@@ -1937,7 +1939,7 @@ async def daily_report_job(
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Каждые 3 часа бот пингует тех, кто ещё не решил ни одной задачи\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n 🏆 В конце дня бот отправляет отчёт + MVP дня\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Напоминания с тэгами приходят только в 18:00 и 23:00 тем, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет дневной отчёт: тэг только у MVP дня и у тех, кто не решил\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -1997,7 +1999,12 @@ def main():
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore))  # hidden owner-only
 
-    app.job_queue.run_repeating(reminder_job, interval=REMINDER_INTERVAL_SECONDS, first=10)
+    for reminder_hour in REMINDER_HOURS:
+        app.job_queue.run_daily(
+            reminder_job,
+            time=time(hour=reminder_hour, minute=0, tzinfo=TZ),
+            name=f"reminder_{reminder_hour:02d}00",
+        )
 
     # End-of-day report (and stats snapshot)
     h, m = _get_daily_time_from_config()

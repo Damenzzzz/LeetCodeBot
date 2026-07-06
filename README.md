@@ -16,6 +16,12 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 - `/backup` and `/restore` help move the bot between servers.
 - If `DATABASE_URL` is set, the bot stores data in Postgres; otherwise it falls back to local SQLite.
 
+## Notification Rules
+
+- Normal command output does not use `@username` mentions.
+- Reminder pings mention only users who have not solved anything yet, at 18:00 and 23:00 Asia/Almaty.
+- The 00:00 daily report mentions only the daily MVP and users with 0 solved problems.
+
 ## Why scoring is more reliable now
 
 The bot uses LeetCode's accepted-submissions query with an explicit limit instead of the smaller mixed recent-submissions list. This avoids missing accepted problems when a user has many failed submissions or many attempts in one day.
