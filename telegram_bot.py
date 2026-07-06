@@ -63,13 +63,15 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # ----------------- Config -----------------
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
@@ -83,6 +85,7 @@ DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
 
 REMINDER_HOURS = (18, 23)
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
+CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
 OWNER_ID = int(os.getenv('OWNER_ID', '0'))  # your personal Telegram user_id; set in Railway Variables
@@ -190,6 +193,17 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS seen_members (
+            telegram_id BIGINT PRIMARY KEY,
+            username TEXT,
+            full_name TEXT,
+            is_bot INTEGER DEFAULT 0
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -253,6 +267,25 @@ def ensure_db_schema():
         db_set_config("db_schema_version", "3")
         current = 3
 
+    # v4: seen_members table for hidden admin command /tagunregistered
+    if current < 4:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_members (
+                telegram_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                is_bot INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+        db_set_config("db_schema_version", "4")
+        current = 4
+
 
 def db_set_config(key: str, value: str):
     conn = db_connect()
@@ -303,6 +336,29 @@ def list_users():
     conn = db_connect()
     cur = conn.cursor()
     cur.execute("SELECT telegram_id, username, leetcode_nick FROM users")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def remember_seen_member(tid: int, username: str, full_name: str, is_bot: bool = False):
+    if not tid:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        _upsert_sql("seen_members", ["telegram_id", "username", "full_name", "is_bot"], ["telegram_id"]),
+        (int(tid), username or "", full_name or "", 1 if is_bot else 0),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_seen_members():
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id, username, full_name, is_bot FROM seen_members")
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -454,6 +510,12 @@ def collect_backup_data() -> Dict[str, Any]:
     cur.execute("SELECT telegram_id, count FROM warns")
     warns_rows = [{"telegram_id": int(tid), "count": int(c or 0)} for tid, c in cur.fetchall()]
 
+    cur.execute("SELECT telegram_id, username, full_name, is_bot FROM seen_members")
+    seen_members_rows = [
+        {"telegram_id": int(tid), "username": str(uname or ""), "full_name": str(full_name or ""), "is_bot": int(is_bot or 0)}
+        for tid, uname, full_name, is_bot in cur.fetchall()
+    ]
+
     conn.close()
 
     return {
@@ -465,6 +527,7 @@ def collect_backup_data() -> Dict[str, Any]:
             "config": config_rows,
             "leaderboard": leaderboard_rows,
             "warns": warns_rows,
+            "seen_members": seen_members_rows,
         },
     }
 
@@ -859,7 +922,27 @@ async def maybe_set_group_chat(update: Update):
     Keep this hook for backward compatibility with handlers that call it.
     Report chat/topic is configured explicitly by /setgroup.
     """
+    user = update.effective_user
+    chat = update.effective_chat
+    if user and chat and chat.type in ("group", "supergroup"):
+        remember_seen_member(user.id, user.username or "", user.full_name or "", bool(user.is_bot))
     return
+
+
+async def remember_message_sender(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+    if user and chat and chat.type in ("group", "supergroup"):
+        remember_seen_member(user.id, user.username or "", user.full_name or "", bool(user.is_bot))
+
+
+async def remember_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or chat.type not in ("group", "supergroup") or not msg:
+        return
+    for user in msg.new_chat_members or []:
+        remember_seen_member(user.id, user.username or "", user.full_name or "", bool(user.is_bot))
 
 
 def _get_report_thread_id() -> Optional[int]:
@@ -984,6 +1067,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config_rows = data.get("config")
     leaderboard_rows = data.get("leaderboard")
     warns_rows = data.get("warns")
+    seen_members_rows = data.get("seen_members")
 
     if isinstance(data.get("tables"), dict):
         t = data["tables"]
@@ -992,6 +1076,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         config_rows = config_rows or t.get("config")
         leaderboard_rows = leaderboard_rows or t.get("leaderboard")
         warns_rows = warns_rows or t.get("warns")
+        seen_members_rows = seen_members_rows or t.get("seen_members")
 
     if users_rows is None and stats_rows is None and config_rows is None:
         await update.message.reply_text("⚠️ Это не похоже на бэкап (нет users/daily_stats/config).")
@@ -1010,6 +1095,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("DELETE FROM config")
         cur.execute("DELETE FROM leaderboard")
         cur.execute("DELETE FROM warns")
+        cur.execute("DELETE FROM seen_members")
 
         # Restore config
         if config_rows:
@@ -1092,6 +1178,21 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     cur,
                     _upsert_sql("warns", ["telegram_id", "count"], ["telegram_id"]),
                     (int(tid), int(c)),
+                )
+
+        # Restore seen members (optional)
+        if seen_members_rows:
+            for row in seen_members_rows:
+                tid = row.get("telegram_id") or row.get("tid")
+                if tid is None:
+                    continue
+                uname = row.get("username") or row.get("uname") or ""
+                full_name = row.get("full_name") or row.get("name") or ""
+                is_bot = int(row.get("is_bot") or 0)
+                db_execute(
+                    cur,
+                    _upsert_sql("seen_members", ["telegram_id", "username", "full_name", "is_bot"], ["telegram_id"]),
+                    (int(tid), str(uname), str(full_name), int(is_bot)),
                 )
 
         conn.commit()
@@ -1628,6 +1729,69 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await auto_backup(context, "unwarn_user")
     await update.message.reply_text(f"✅ Предупреждения сброшены для {target_name}.")
 
+
+async def tagunregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup"):
+        await update.message.reply_text("Эту команду нужно запускать в группе.")
+        return
+
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    if context.args:
+        unregistered = []
+        for raw in context.args:
+            raw = raw.strip()
+            if not raw:
+                continue
+            if raw.startswith("@"):
+                unregistered.append(raw)
+            else:
+                unregistered.append(mention(raw))
+    else:
+        registered_ids = {int(tid) for tid, _uname, _nick in list_users()}
+        unregistered = []
+        for tid, username, full_name, is_bot in list_seen_members():
+            tid = int(tid)
+            if tid in registered_ids or int(is_bot or 0):
+                continue
+            if username:
+                unregistered.append(mention(username))
+            elif full_name:
+                unregistered.append(display_name(full_name))
+
+    # Deduplicate while preserving order.
+    unregistered = list(dict.fromkeys(unregistered))
+
+    if not unregistered:
+        await update.message.reply_text(
+            "✅ Среди тех, кого я уже видел в группе, незарегистрированных нет.\n"
+            "Важно: Telegram не даёт боту полный список участников, поэтому новые тихие участники появятся тут после сообщения/команды/входа в группу.\n"
+            "Если у тебя есть список, можно вручную: /tagunregistered @user1 @user2"
+        )
+        return
+
+    chunks = []
+    cur = []
+    cur_len = 0
+    for name in unregistered:
+        add_len = len(name) + 2
+        if cur and cur_len + add_len > 3500:
+            chunks.append(cur)
+            cur = []
+            cur_len = 0
+        cur.append(name)
+        cur_len += add_len
+    if cur:
+        chunks.append(cur)
+
+    for i, chunk in enumerate(chunks):
+        prefix = "Пожалуйста, зарегистрируйтесь через /register <leetcode_nick>:\n" if i == 0 else ""
+        await update.message.reply_text(prefix + ", ".join(chunk))
+
 async def clearboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     user = update.effective_user
@@ -1995,27 +2159,33 @@ def main():
     app.add_handler(CommandHandler("recheckday", recheckday))
     app.add_handler(CommandHandler("settime", settime))  # owner-only
     app.add_handler(CommandHandler("unwarn", unwarn))  # owner-only
+    app.add_handler(CommandHandler("tagunregistered", tagunregistered))  # hidden admin-only
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("restore", restore))  # hidden owner-only
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, remember_new_members))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, remember_message_sender))
 
-    for reminder_hour in REMINDER_HOURS:
+    if CHALLENGE_AUTOMATION_ENABLED:
+        for reminder_hour in REMINDER_HOURS:
+            app.job_queue.run_daily(
+                reminder_job,
+                time=time(hour=reminder_hour, minute=0, tzinfo=TZ),
+                name=f"reminder_{reminder_hour:02d}00",
+            )
+
+        # End-of-day report (and stats snapshot)
+        h, m = _get_daily_time_from_config()
         app.job_queue.run_daily(
-            reminder_job,
-            time=time(hour=reminder_hour, minute=0, tzinfo=TZ),
-            name=f"reminder_{reminder_hour:02d}00",
+            daily_report_job,
+            time=time(hour=h, minute=m, tzinfo=TZ),
+            name="daily_report",
         )
 
-    # End-of-day report (and stats snapshot)
-    h, m = _get_daily_time_from_config()
-    app.job_queue.run_daily(
-        daily_report_job,
-        time=time(hour=h, minute=m, tzinfo=TZ),
-        name="daily_report",
-    )
-
-    # Catch-up once shortly after start (если бот был оффлайн в момент отчёта)
-    app.job_queue.run_once(catchup_job, when=30)
+        # Catch-up once shortly after start (если бот был оффлайн в момент отчёта)
+        app.job_queue.run_once(catchup_job, when=30)
+    else:
+        logger.info("Challenge automation is disabled; reminders and daily reports are not scheduled")
 
     print("Bot started. Press Ctrl-C to stop.")
     app.run_polling()

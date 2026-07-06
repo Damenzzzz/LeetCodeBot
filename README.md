@@ -19,8 +19,10 @@ Telegram bot for a group challenge: every participant must solve at least one Le
 ## Notification Rules
 
 - Normal command output does not use `@username` mentions.
+- Set `CHALLENGE_AUTOMATION_ENABLED=1` to enable scheduled reminders and the daily report.
 - Reminder pings mention only users who have not solved anything yet, at 18:00 and 23:00 Asia/Almaty.
 - The 00:00 daily report mentions only the daily MVP and users with 0 solved problems.
+- Hidden admin command `/tagunregistered` pings known group members who have not registered yet.
 
 ## Why scoring is more reliable now
 
