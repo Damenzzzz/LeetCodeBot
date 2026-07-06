@@ -624,6 +624,10 @@ def _format_task_entry(s: str) -> str:
     return f"{prefix} {title}"
 
 
+def _format_task_entry_html(s: str) -> str:
+    return html.escape(_format_task_entry(s), quote=False)
+
+
 def _merge_titles(old_titles: List[str], new_titles: List[str]) -> List[str]:
     """
     Merge today's titles in a monotonic way:
@@ -887,6 +891,10 @@ def profile_label(uname: str) -> str:
     if username and " " not in username and username != "unknown":
         return f'<a href="https://t.me/{html.escape(username, quote=True)}">{html.escape(username)}</a>'
     return html.escape(raw)
+
+
+def html_text(value: Any) -> str:
+    return html.escape(str(value), quote=False)
 
 
 def display_name(uname: str) -> str:
@@ -1329,7 +1337,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
 
-    target_display = display_name(user.username or user.full_name)
+    target_display = profile_label(user.username or user.full_name)
     nick = None
 
     # With argument: /check @user or /check <leetcodeNick>
@@ -1340,12 +1348,12 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for _, uname, lnick in rows:
                 if mention(uname).lower() == t:
                     nick = lnick
-                    target_display = display_name(uname)
+                    target_display = profile_label(uname)
                     break
         else:
             # allow direct leetcode nick
             nick = target
-            target_display = target
+            target_display = html_text(target)
         target_tid = None
     else:
         # no args -> self
@@ -1393,14 +1401,18 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     if not titles:
-        await update.message.reply_text(f"😴 {target_display}, сегодня ({today}) пока 0 задач. Пора спасать статистику!")
+        await update.message.reply_text(
+            f"😴 {target_display}, сегодня ({today}) пока 0 задач. Пора спасать статистику!",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         return
 
     msg = (
         f"🔥 {target_display}, сегодня ({today}) решено {len(titles)} задач:\n"
-        + "\n".join([f"• {_format_task_entry(t)}" for t in titles])
+        + "\n".join([f"• {_format_task_entry_html(t)}" for t in titles])
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1418,7 +1430,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) == 1:
         target = context.args[0].strip()
         nick = None
-        display = target
+        display = html_text(target)
         target_tid = None
 
         if target.startswith("@"):
@@ -1426,7 +1438,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for tid, uname, lnick in rows:
                 if (mention(uname)).lower() == t:
                     nick = lnick
-                    display = display_name(uname)
+                    display = profile_label(uname)
                     target_tid = int(tid)
                     break
         else:
@@ -1441,10 +1453,14 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not target.startswith("@"):
             for _tid, uname, lnick in rows:
                 if str(lnick).lower() == str(nick).lower():
-                    display = display_name(uname)
+                    display = profile_label(uname)
                     break
         if err:
-            await update.message.reply_text(f"⚠️ Ошибка при проверке {display}: {err}")
+            await update.message.reply_text(
+                f"⚠️ Ошибка при проверке {display}: {html_text(err)}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
             return
 
         # Live points update when target is a registered Telegram user
@@ -1455,25 +1471,29 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
         if not titles:
-            await update.message.reply_text(f"{display} — сегодня ({today}) 0 задач ❌")
+            await update.message.reply_text(
+                f"{display} — сегодня ({today}) 0 задач ❌",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
             return
 
         msg = f"{display} — сегодня ({today}) решил {len(titles)} задач ✅:\n" + "\n".join(
-            [f"• {_format_task_entry(t)}" for t in titles]
+            [f"• {_format_task_entry_html(t)}" for t in titles]
         )
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
         return
 
     # /list - summary
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
 
-    scored = []  # (cnt, name, line, had_error)
+    scored = []  # (cnt, sort_name, line, had_error)
     for tid, uname, nick in rows:
         titles, err = accepted_titles_today(nick)
         if err:
-            name = display_name(uname)
-            scored.append((-1, name, f"{name} — ❓ ошибка проверки", True))
+            name = profile_label(uname)
+            scored.append((-1, (uname or "").lower(), f"{name} — ❓ ошибка проверки", True))
             continue
 
         cnt = len(titles or [])
@@ -1482,14 +1502,14 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         mark = "✅" if cnt >= 1 else "❌"
-        name = display_name(uname)
-        scored.append((cnt, name, f"{name} — {cnt} задач {mark}", False))
+        name = profile_label(uname)
+        scored.append((cnt, (uname or "").lower(), f"{name} — {cnt} задач {mark}", False))
 
     # Sort: more solved -> top; zeros -> bottom; errors -> very bottom
     scored.sort(key=lambda x: (x[3], -x[0], x[1].lower()))
 
     lines = [line for _, __, line, ___ in scored]
-    await update.message.reply_text(header + "\n" + "\n".join(lines))
+    await update.message.reply_text(header + "\n" + "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1544,7 +1564,6 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = context.args[0].strip().lower()
-    target_display = target[1:] if target.startswith("@") else target
     day = datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
 
@@ -1553,35 +1572,33 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
-        name = display_name(uname)
+        name = profile_label(uname)
+        sort_name = (uname or "").lower()
+        is_target = mention(uname).lower() == target
         if err:
-            items.append((True, -1, name, []))
+            items.append((True, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
             continue
 
         titles = titles or []
         cnt = len(titles)
         mark = "✅" if cnt >= 1 else "❌"
         update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
-        items.append((False, cnt, f"{name} — {cnt} задач {mark}", titles))
+        items.append((False, cnt, sort_name, f"{name} — {cnt} задач {mark}", titles, is_target))
 
-    items.sort(key=lambda x: (x[0], -x[1], x[2].lower()))
+    items.sort(key=lambda x: (x[0], -x[1], x[2]))
 
     lines = []
-    for had_error, _cnt, line, titles in items:
-        if had_error:
-            lines.append(f"{line} — ❓ ошибка проверки")
-            continue
+    for had_error, _cnt, _sort_name, line, titles, is_target in items:
         lines.append(line)
-        name_only = line.split(" — ", 1)[0].strip().lower()
-        if name_only == target_display:
+        if not had_error and is_target:
             if titles:
                 lines.append("   └ решённые задачи:")
                 for t in titles:
-                    lines.append(f"      • {_format_task_entry(t)}")
+                    lines.append(f"      • {_format_task_entry_html(t)}")
             else:
                 lines.append("   └ решённых задач сегодня нет.")
 
-    await update.message.reply_text(header + "\n" + "\n".join(lines))
+    await update.message.reply_text(header + "\n" + "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1605,13 +1622,13 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for tid, uname, _ in rows:
             if mention(uname).lower() == t:
                 target_tid = int(tid)
-                target_uname = display_name(uname)
+                target_uname = profile_label(uname)
                 break
     else:
         for tid, uname, lnick in rows:
             if str(lnick).lower() == target.lower():
                 target_tid = int(tid)
-                target_uname = display_name(uname)
+                target_uname = profile_label(uname)
                 break
 
     if target_tid is None:
@@ -1621,7 +1638,7 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remove_user(target_tid)
     recompute_leaderboard_from_daily_stats()
     await auto_backup(context, "removeuser")
-    await update.message.reply_text(f"✅ Удалил {target_uname} из бота.")
+    await update.message.reply_text(f"✅ Удалил {target_uname} из бота.", parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1634,7 +1651,11 @@ async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_users()
     for _tid, uname, nick in rows:
         if mention(uname).lower() == target:
-            await update.message.reply_text(f"{display_name(uname)} → https://leetcode.com/u/{nick}/")
+            await update.message.reply_text(
+                f"{profile_label(uname)} → https://leetcode.com/u/{html.escape(str(nick), quote=True)}/",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
             return
 
     await update.message.reply_text("Не нашёл пользователя в базе. Пусть он сделает /register <nick>.")
@@ -1712,13 +1733,13 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for tid, uname, _ in rows:
             if mention(uname).lower() == t:
                 target_tid = int(tid)
-                target_name = display_name(uname)
+                target_name = profile_label(uname)
                 break
     else:
         for tid, uname, nick in rows:
             if str(nick).lower() == target.lower():
                 target_tid = int(tid)
-                target_name = display_name(uname)
+                target_name = profile_label(uname)
                 break
 
     if target_tid is None:
@@ -1727,7 +1748,11 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     clear_warns(target_tid)
     await auto_backup(context, "unwarn_user")
-    await update.message.reply_text(f"✅ Предупреждения сброшены для {target_name}.")
+    await update.message.reply_text(
+        f"✅ Предупреждения сброшены для {target_name}.",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def tagunregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1845,7 +1870,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, target_day)
         if err:
-            errors.append(display_name(uname))
+            errors.append(profile_label(uname))
             continue
         update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
         ok += 1
@@ -1857,7 +1882,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if errors:
         msg += "\n⚠️ Ошибка LeetCode у: " + ", ".join(errors)
     await auto_backup(context, "recheckday")
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1893,21 +1918,21 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) == 1:
         target = context.args[0].strip()
         target_tid = None
-        target_uname = target
+        target_uname = html_text(target)
 
         if target.startswith("@"):
             t = target.lower()
             for tid, uname, _ in rows:
                 if mention(uname).lower() == t:
                     target_tid = int(tid)
-                    target_uname = display_name(uname)
+                    target_uname = profile_label(uname)
                     break
         else:
             # allow by LeetCode nick
             for tid, uname, nick in rows:
                 if nick.lower() == target.lower():
                     target_tid = int(tid)
-                    target_uname = display_name(uname)
+                    target_uname = profile_label(uname)
                     break
 
         if target_tid is None:
@@ -1923,7 +1948,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         for d in days:
             msg.append(f"{d}: {per_day.get(d, 0)}")
-        await update.message.reply_text("\n".join(msg))
+        await update.message.reply_text("\n".join(msg), parse_mode="HTML", disable_web_page_preview=True)
         return
 
     # /week summary
@@ -1932,14 +1957,14 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for tid, uname, _ in rows:
         per_day = week_map.get(int(tid), {})
         total = sum(per_day.get(d, 0) for d in days)
-        scores.append((total, display_name(uname)))
+        scores.append((total, profile_label(uname), (uname or "").lower()))
 
-    scores.sort(key=lambda x: (-x[0], x[1].lower()))
-    for total, uname in scores:
+    scores.sort(key=lambda x: (-x[0], x[2]))
+    for total, uname, _sort_name in scores:
         trophy = "🏆" if total == scores[0][0] and total > 0 else ""
         msg_lines.append(f"{uname}: {total} задач {trophy}")
 
-    await update.message.reply_text("\n".join(msg_lines))
+    await update.message.reply_text("\n".join(msg_lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
 # ----------------- Jobs: reminder + daily report -----------------
