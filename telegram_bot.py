@@ -2293,17 +2293,18 @@ async def daily_report_job(
     warns_key = f"warns_applied_{day_str}"
     should_apply_warns = apply_warns and not bool(db_get_config(warns_key))
 
-    items = []  # (had_error, cnt, display_name, tagged_name, warn_count)
+    items = []  # (had_error, cnt, profile_name, tagged_name, sort_name, warn_count)
     mvp_max = -1
     mvp_winners: List[str] = []
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
-        name = html_text(display_name(uname))
+        name = profile_label(uname)
+        sort_name = (uname or "").lower()
         tagged_name = report_mention(int(tid), uname)
 
         if err:
-            items.append((True, -1, name, tagged_name, None))
+            items.append((True, -1, name, tagged_name, sort_name, None))
             continue
 
         titles = titles or []
@@ -2325,7 +2326,7 @@ async def daily_report_job(
                     kicked = True
                 except Exception as e:
                     logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
-        items.append((False, cnt, name, tagged_name, warn_count))
+        items.append((False, cnt, name, tagged_name, sort_name, warn_count))
 
         if cnt > mvp_max:
             mvp_max = cnt
@@ -2333,10 +2334,10 @@ async def daily_report_job(
         elif cnt == mvp_max and cnt > 0:
             mvp_winners.append(tagged_name)
 
-    items.sort(key=lambda x: (x[0], -x[1], x[2].lower()))
+    items.sort(key=lambda x: (x[0], -x[1], x[4]))
 
     report_lines = []
-    for had_error, cnt, name, tagged_name, warn_count in items:
+    for had_error, cnt, name, tagged_name, _sort_name, warn_count in items:
         if had_error:
             report_lines.append(f"{name} — ❓ ошибка проверки (LeetCode недоступен)")
         else:
