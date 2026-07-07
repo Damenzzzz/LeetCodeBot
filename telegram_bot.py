@@ -129,14 +129,8 @@ def acquire_singleton_lock() -> bool:
 
     conn = db_connect()
     cur = conn.cursor()
-    cur.execute("SELECT pg_try_advisory_lock(8441710556)")
-    row = cur.fetchone()
-    locked = bool(row and row[0])
-    if not locked:
-        conn.close()
-        logger.error("Another bot instance already holds the singleton lock; exiting this process")
-        return False
-
+    logger.info("Waiting for singleton lock")
+    cur.execute("SELECT pg_advisory_lock(8441710556)")
     _singleton_lock_conn = conn
     logger.info("Singleton lock acquired")
     return True
