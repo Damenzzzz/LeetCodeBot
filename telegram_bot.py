@@ -2396,6 +2396,22 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("catchup_job failed: %s", e)
 
 
+async def oneoff_report_2026_07_07(context: ContextTypes.DEFAULT_TYPE):
+    day_str = "2026-07-07"
+    key = f"oneoff_report_sent_{day_str}"
+    if db_get_config(key):
+        logger.info("One-off report %s already sent; skipping", day_str)
+        return
+    if not db_get_config("report_chat_id"):
+        logger.info("One-off report %s skipped: report_chat_id not set", day_str)
+        return
+
+    logger.info("Sending one-off corrected report for %s", day_str)
+    await daily_report_job(context, target_day=datetime.strptime(day_str, "%Y-%m-%d").date(), apply_warns=False)
+    db_set_config(key, _now_str())
+    logger.info("One-off corrected report for %s sent", day_str)
+
+
 
 # ----------------- Main -----------------
 def main():
@@ -2455,6 +2471,7 @@ def main():
             time=time(hour=h, minute=m, tzinfo=TZ),
             name="daily_report",
         )
+        app.job_queue.run_once(oneoff_report_2026_07_07, when=20, name="oneoff_report_2026_07_07")
 
         logger.info(
             "Scheduled jobs: evening_status=%02d:00, final_reminder=%02d:00, daily_report=%02d:%02d Asia/Almaty",
