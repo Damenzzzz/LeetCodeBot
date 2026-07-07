@@ -2124,7 +2124,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         (
             f"{e} Напоминалка: сегодня ещё без задач:"
             + ", ".join(not_done)
-            + " \nПравило простое: минимум 1 задача. 3 дня подряд без задач = kick из группы. Погнали! 🚀"
+            + " \nПравило простое: минимум 1 задача. 3 пропущенных дня = kick из группы. Погнали! 🚀"
         ),
     )
 
@@ -2179,9 +2179,6 @@ async def daily_report_job(
                     kicked = True
                 except Exception as e:
                     logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
-        elif should_apply_warns and cnt > 0 and get_warn_count(int(tid)) > 0:
-            clear_warns(int(tid))
-
         update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
 
         items.append((False, cnt, name, tagged_name, warn_count))
@@ -2228,7 +2225,7 @@ async def daily_report_job(
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n 📋 В 18:00 бот отправляет общий статус: кто сколько задач решил сегодня\n ⏰ В 23:00 бот тэгнет только тех, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет итог дня: тэг только у MVP дня и у тех, кто не решил\n ⚠️ Кто не решает 3 дня подряд — получает 3/3 предупреждения и кикается из группы\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n 📋 В 18:00 бот отправляет общий статус: кто сколько задач решил сегодня\n ⏰ В 23:00 бот тэгнет только тех, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет итог дня: тэг только у MVP дня и у тех, кто не решил\n ⚠️ 3 пропущенных дня за челлендж — 3/3 предупреждения и kick из группы\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
