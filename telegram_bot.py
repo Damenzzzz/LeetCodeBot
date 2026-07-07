@@ -901,6 +901,16 @@ def mention(uname: str) -> str:
     return uname or "unknown"
 
 
+def report_mention(tid: int, uname: str) -> str:
+    raw = (uname or "").strip()
+    username = raw[1:] if raw.startswith("@") else raw
+    if username and " " not in username:
+        return f"@{username}"
+
+    label = display_name(raw) if raw else f"user_{tid}"
+    return f'<a href="tg://user?id={int(tid)}">{html.escape(label)}</a>'
+
+
 def profile_label(uname: str) -> str:
     raw = (uname or "unknown").strip() or "unknown"
     username = raw[1:] if raw.startswith("@") else raw
@@ -981,7 +991,7 @@ def _get_report_thread_id() -> Optional[int]:
 
 async def send_report_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
     thread_id = _get_report_thread_id()
-    kwargs = {"chat_id": chat_id, "text": text}
+    kwargs = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
     if thread_id is not None:
         kwargs["message_thread_id"] = thread_id
     await context.bot.send_message(**kwargs)
@@ -2044,7 +2054,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         if not titles:
-            not_done.append(mention(uname))
+            not_done.append(report_mention(int(tid), uname))
 
     # Everyone done -> celebrate once/day
     if not not_done:
@@ -2102,8 +2112,8 @@ async def daily_report_job(
 
     for tid, uname, nick in rows:
         titles, err = accepted_titles_on_day(nick, day)
-        name = display_name(uname)
-        tagged_name = mention(uname)
+        name = html_text(display_name(uname))
+        tagged_name = report_mention(int(tid), uname)
 
         if err:
             items.append((True, -1, name, tagged_name, None))
