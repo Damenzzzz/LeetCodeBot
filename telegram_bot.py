@@ -49,6 +49,7 @@ import json
 import sqlite3
 import logging
 import html
+import re
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
@@ -314,6 +315,7 @@ def db_delete_config(key: str):
 
 
 def add_user(tid: int, username: str, nick: str):
+    nick = normalize_leetcode_nick(nick)
     conn = db_connect()
     cur = conn.cursor()
     db_execute(
@@ -334,6 +336,7 @@ def remove_user(tid: int):
 
 
 def update_user_nick(tid: int, nick: str):
+    nick = normalize_leetcode_nick(nick)
     conn = db_connect()
     cur = conn.cursor()
     db_execute(cur, "UPDATE users SET leetcode_nick=? WHERE telegram_id=?", (nick, int(tid)))
@@ -770,11 +773,31 @@ def get_week_stats(days: List[str]):
 
 
 # ----------------- LeetCode helpers -----------------
+def normalize_leetcode_nick(raw: str) -> str:
+    nick = (raw or "").strip()
+    if not nick:
+        return ""
+
+    nick = nick.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    if "leetcode.com" in nick.lower() or "/" in nick:
+        parts = [p for p in re.split(r"/+", nick) if p and "leetcode.com" not in p.lower()]
+        for marker in ("u", "profile"):
+            if marker in parts:
+                idx = parts.index(marker)
+                if idx + 1 < len(parts):
+                    return parts[idx + 1].strip()
+        if parts:
+            return parts[-1].strip()
+
+    return nick.lstrip("@").strip()
+
+
 def nick_escape(s: str) -> str:
     return s.replace('"', '\\"')
 
 
 def leetcode_recent_accepted_submissions(nick: str):
+    nick = normalize_leetcode_nick(nick)
     q = """
     query recentAccepted($username: String!, $limit: Int!) {
       recentAcSubmissionList(username: $username, limit: $limit) {
@@ -803,6 +826,95 @@ def leetcode_recent_accepted_submissions(nick: str):
         except Exception as e:
             last_err = e
     raise last_err
+
+
+def leetcode_recent_submissions(nick: str):
+    nick = normalize_leetcode_nick(nick)
+    q = """
+    query recentSubmissions($username: String!, $limit: Int!) {
+      recentSubmissionList(username: $username, limit: $limit) {
+        title
+        titleSlug
+        timestamp
+        statusDisplay
+      }
+    }
+    """
+    last_err = None
+    for _attempt in range(3):
+        try:
+            resp = requests.post(
+                LEETCODE_GRAPHQL,
+                json={
+                    "query": q,
+                    "variables": {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT},
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errors"):
+                raise RuntimeError(data["errors"])
+            return data.get("data", {}).get("recentSubmissionList") or []
+        except Exception as e:
+            last_err = e
+    raise last_err
+
+
+def leetcode_user_exists(nick: str) -> bool:
+    nick = normalize_leetcode_nick(nick)
+    q = """
+    query userExists($username: String!) {
+      matchedUser(username: $username) {
+        username
+      }
+    }
+    """
+    resp = requests.post(
+        LEETCODE_GRAPHQL,
+        json={"query": q, "variables": {"username": nick}},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("errors"):
+        raise RuntimeError(data["errors"])
+    return bool((data.get("data") or {}).get("matchedUser"))
+
+
+def _accepted_titles_from_submissions(subs: List[Dict[str, Any]], target_day: date, require_accepted_status: bool) -> List[str]:
+    titles: List[str] = []
+    seen = set()
+
+    for item in subs:
+        if require_accepted_status and str(item.get("statusDisplay") or "").lower() != "accepted":
+            continue
+
+        ts = item.get("timestamp")
+        if ts is None:
+            continue
+        try:
+            ts_int = int(ts)
+        except Exception:
+            continue
+
+        # seconds vs ms
+        if ts_int > 1_000_000_000_000:
+            ts_int //= 1000
+
+        dt = datetime.fromtimestamp(ts_int, tz=TZ)
+        if dt.date() != target_day:
+            continue
+
+        title = item.get("title") or "Unknown"
+        slug = item.get("titleSlug") or None
+        key = slug or title
+        if key not in seen:
+            seen.add(key)
+            diff = leetcode_question_difficulty(slug)
+            titles.append(_encode_task_entry(diff, title, slug))
+
+    return titles
 
 
 
@@ -843,6 +955,7 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
     Returns (titles, err).
     titles is unique list of problem titles with Accepted submissions on target_day.
     """
+    nick = normalize_leetcode_nick(nick)
     day_key = target_day.strftime("%Y-%m-%d")
     cache_key = (nick, day_key)
 
@@ -857,33 +970,23 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
         logger.exception("LeetCode fetch error for %s: %s", nick, e)
         return None, str(e)
 
-    titles: List[str] = []
-    seen = set()
-
-    for item in subs:
-        ts = item.get("timestamp")
-        if ts is None:
-            continue
+    titles = _accepted_titles_from_submissions(subs, target_day, require_accepted_status=False)
+    if not titles:
         try:
-            ts_int = int(ts)
-        except Exception:
-            continue
+            fallback_subs = leetcode_recent_submissions(nick)
+            fallback_titles = _accepted_titles_from_submissions(fallback_subs, target_day, require_accepted_status=True)
+            if fallback_titles:
+                logger.info("LeetCode fallback found %s accepted titles for %s on %s", len(fallback_titles), nick, day_key)
+                titles = fallback_titles
+        except Exception as e:
+            logger.warning("LeetCode fallback fetch error for %s: %s", nick, e)
 
-        # seconds vs ms
-        if ts_int > 1_000_000_000_000:
-            ts_int //= 1000
-
-        dt = datetime.fromtimestamp(ts_int, tz=TZ)
-        if dt.date() != target_day:
-            continue
-
-        title = item.get("title") or "Unknown"
-        slug = item.get("titleSlug") or None
-        key = slug or title
-        if key not in seen:
-            seen.add(key)
-            diff = leetcode_question_difficulty(slug)
-            titles.append(_encode_task_entry(diff, title, slug))
+    if not titles:
+        try:
+            if not leetcode_user_exists(nick):
+                return None, f"LeetCode user not found: {nick}"
+        except Exception as e:
+            logger.warning("LeetCode user existence check failed for %s: %s", nick, e)
 
     _cache[cache_key] = (titles, now_ts)
     return titles, None
@@ -1275,7 +1378,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.message.reply_text("Использование: /register <leetcode_nick>")
         return
-    nick = context.args[0].strip()
+    nick = normalize_leetcode_nick(context.args[0])
     add_user(user.id, user.username or user.full_name, nick)
     await auto_backup(context, "register")
 
@@ -1679,7 +1782,7 @@ async def setnick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = context.args[0].strip()
-    new_nick = context.args[1].strip()
+    new_nick = normalize_leetcode_nick(context.args[1])
     found = find_user_by_telegram_username(target)
     if not found:
         await update.message.reply_text("Не нашёл пользователя в базе.")
@@ -1707,6 +1810,7 @@ async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = list_users()
     for _tid, uname, nick in rows:
         if mention(uname).lower() == target:
+            nick = normalize_leetcode_nick(nick)
             await update.message.reply_text(
                 f"{profile_label(uname)} → https://leetcode.com/u/{html.escape(str(nick), quote=True)}/",
                 parse_mode="HTML",
