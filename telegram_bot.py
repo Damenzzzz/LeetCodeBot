@@ -81,8 +81,8 @@ AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").lower() not in ("0",
 AUTO_BACKUP_SEND_TO_OWNER = os.getenv("AUTO_BACKUP_SEND_TO_OWNER", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "20"))
 
-DAILY_HOUR = int(os.getenv("DAILY_HOUR", "0"))
-DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
+DAILY_HOUR = int(os.getenv("DAILY_HOUR", "23"))
+DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "59"))
 
 EVENING_STATUS_HOUR = 18
 FINAL_REMINDER_HOUR = 23
@@ -713,7 +713,7 @@ def _merge_titles(old_titles: List[str], new_titles: List[str]) -> List[str]:
     return merged
 
 
-def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, titles: List[str]):
+def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, titles: List[str]) -> List[str]:
     """
     Saves daily snapshot for (day, user) and updates all-time leaderboard points.
     IMPORTANT: This function is designed to be called multiple times per day (live updates).
@@ -766,6 +766,21 @@ def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, t
 
     conn.commit()
     conn.close()
+    return merged_titles
+
+
+def ensure_daily_report_time_config():
+    h_raw = db_get_config("daily_hour")
+    m_raw = db_get_config("daily_minute")
+    if h_raw is None and m_raw is None:
+        db_set_config("daily_hour", str(DAILY_HOUR))
+        db_set_config("daily_minute", str(DAILY_MINUTE))
+        return
+    if str(h_raw) == "0" and str(m_raw) == "0":
+        db_set_config("daily_hour", "23")
+        db_set_config("daily_minute", "59")
+
+
 def clear_leaderboard_and_season_from(day_str: str):
     conn = db_connect()
     cur = conn.cursor()
@@ -1543,7 +1558,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target_tid = int(tid)
                 break
         if target_tid is not None:
-            update_snapshot_and_leaderboard(today_str, int(target_tid), len(titles or []), titles or [])
+            titles = update_snapshot_and_leaderboard(today_str, int(target_tid), len(titles or []), titles or [])
     except Exception:
         pass
 
@@ -1555,7 +1570,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 tid_live = int(tid0)
                 break
         if tid_live is not None:
-            update_snapshot_and_leaderboard(today, int(tid_live), len(titles), titles)
+            titles = update_snapshot_and_leaderboard(today, int(tid_live), len(titles), titles)
     except Exception:
         pass
     if not titles:
@@ -1624,7 +1639,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Live points update when target is a registered Telegram user
         if target_tid is not None:
             try:
-                update_snapshot_and_leaderboard(today, int(target_tid), len(titles or []), titles or [])
+                titles = update_snapshot_and_leaderboard(today, int(target_tid), len(titles or []), titles or [])
             except Exception:
                 pass
 
@@ -1656,7 +1671,8 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         cnt = len(titles or [])
         try:
-            update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles or [])
+            titles = update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles or [])
+            cnt = len(titles or [])
         except Exception:
             pass
         mark = "✅" if cnt >= 1 else "❌"
@@ -1739,8 +1755,9 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         titles = titles or []
         cnt = len(titles)
+        titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
+        cnt = len(titles)
         mark = "✅" if cnt >= 1 else "❌"
-        update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
         items.append((False, cnt, sort_name, f"{name} — {cnt} задач {mark}", titles, is_target))
 
     items.sort(key=lambda x: (x[0], -x[1], x[2]))
@@ -2185,7 +2202,8 @@ async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
         titles = titles or []
         cnt = len(titles)
         try:
-            update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles)
+            titles = update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles)
+            cnt = len(titles)
         except Exception:
             pass
 
@@ -2225,7 +2243,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         if err:
             continue
         try:
-            update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
+            titles = update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
         except Exception:
             pass
         if not titles:
@@ -2296,6 +2314,8 @@ async def daily_report_job(
 
         titles = titles or []
         cnt = len(titles)
+        titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
+        cnt = len(titles)
 
         # Warn system: only if LeetCode check succeeded (no err) and user solved 0 tasks today.
         # For catch-up reports (yesterday), logic is the same. We don't warn on LC errors above.
@@ -2311,8 +2331,6 @@ async def daily_report_job(
                     kicked = True
                 except Exception as e:
                     logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
-        update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
-
         items.append((False, cnt, name, tagged_name, warn_count))
 
         if cnt > mvp_max:
@@ -2357,7 +2375,7 @@ async def daily_report_job(
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n 📋 В 18:00 бот отправляет общий статус: кто сколько задач решил сегодня\n ⏰ В 23:00 бот тэгнет только тех, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет итог дня: тэг только у MVP дня и у тех, кто не решил\n ⚠️ 3 пропущенных дня за челлендж — 3/3 предупреждения и kick из группы\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n 📋 В 18:00 бот отправляет общий статус: кто сколько задач решил сегодня\n ⏰ В 23:00 бот тэгнет только тех, кто ещё не решил ни одной задачи\n 🧾 В 23:59 бот отправляет итог дня: тэг только у MVP дня и у тех, кто не решил\n ⚠️ 3 пропущенных дня за челлендж — 3/3 предупреждения и kick из группы\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -2388,6 +2406,7 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------- Main -----------------
 def main():
     init_db()
+    ensure_daily_report_time_config()
     if not acquire_singleton_lock():
         return
     token = os.getenv("TELEGRAM_TOKEN")
