@@ -100,6 +100,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # in-memory cache: (nick, yyyy-mm-dd) -> (titles_list, fetched_at_epoch_seconds)
 _cache: Dict[Tuple[str, str], Tuple[List[str], float]] = {}
+_singleton_lock_conn = None
 
 
 # ----------------- DB helpers -----------------
@@ -115,6 +116,30 @@ def db_execute(cur, sql: str, params: Tuple[Any, ...] = ()):
     if USE_POSTGRES:
         sql = sql.replace("?", "%s")
     return cur.execute(sql, params)
+
+
+def acquire_singleton_lock() -> bool:
+    """
+    Prevent two Railway instances of this bot from polling/scheduling at the same time.
+    The Postgres advisory lock is held while this process is alive.
+    """
+    global _singleton_lock_conn
+    if not USE_POSTGRES:
+        return True
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute("SELECT pg_try_advisory_lock(8441710556)")
+    row = cur.fetchone()
+    locked = bool(row and row[0])
+    if not locked:
+        conn.close()
+        logger.error("Another bot instance already holds the singleton lock; exiting this process")
+        return False
+
+    _singleton_lock_conn = conn
+    logger.info("Singleton lock acquired")
+    return True
 
 
 def _upsert_sql(table: str, columns: List[str], conflict_columns: List[str]) -> str:
@@ -2363,6 +2388,8 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------- Main -----------------
 def main():
     init_db()
+    if not acquire_singleton_lock():
+        return
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         print("ERROR: set TELEGRAM_TOKEN environment variable")
