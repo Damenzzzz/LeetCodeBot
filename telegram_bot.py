@@ -87,6 +87,7 @@ DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "0"))
 EVENING_STATUS_HOUR = 18
 FINAL_REMINDER_HOUR = 23
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
+DEEP_CACHE_TTL_SECONDS = 10 * 60
 CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
@@ -950,18 +951,19 @@ def leetcode_question_difficulty(title_slug: Optional[str]) -> str:
     return diff_up
 
 
-def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[str]], Optional[str]]:
+def accepted_titles_on_day(nick: str, target_day: date, deep_check: bool = False) -> Tuple[Optional[List[str]], Optional[str]]:
     """
     Returns (titles, err).
     titles is unique list of problem titles with Accepted submissions on target_day.
     """
     nick = normalize_leetcode_nick(nick)
     day_key = target_day.strftime("%Y-%m-%d")
-    cache_key = (nick, day_key)
+    cache_key = (nick, day_key, bool(deep_check))
 
     now_ts = datetime.now(TZ).timestamp()
     cached = _cache.get(cache_key)
-    if cached and (now_ts - cached[1] < CACHE_TTL_SECONDS):
+    ttl = DEEP_CACHE_TTL_SECONDS if deep_check else CACHE_TTL_SECONDS
+    if cached and (now_ts - cached[1] < ttl):
         return cached[0], None
 
     try:
@@ -971,7 +973,7 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
         return None, str(e)
 
     titles = _accepted_titles_from_submissions(subs, target_day, require_accepted_status=False)
-    if not titles:
+    if deep_check and not titles:
         try:
             fallback_subs = leetcode_recent_submissions(nick)
             fallback_titles = _accepted_titles_from_submissions(fallback_subs, target_day, require_accepted_status=True)
@@ -981,7 +983,7 @@ def accepted_titles_on_day(nick: str, target_day: date) -> Tuple[Optional[List[s
         except Exception as e:
             logger.warning("LeetCode fallback fetch error for %s: %s", nick, e)
 
-    if not titles:
+    if deep_check and not titles:
         try:
             if not leetcode_user_exists(nick):
                 return None, f"LeetCode user not found: {nick}"
@@ -1384,10 +1386,11 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # сброс кеша на сегодня для нового ника, чтобы /list сразу показал актуально
     today_key = datetime.now(TZ).strftime("%Y-%m-%d")
-    _cache.pop((nick, today_key), None)
+    _cache.pop((nick, today_key, False), None)
+    _cache.pop((nick, today_key, True), None)
 
     # небольшая проверка: сколько уже решено сегодня
-    titles, err = accepted_titles_today(nick)
+    titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
     if err:
         await update.message.reply_text(
             f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
@@ -1499,7 +1502,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ты не зарегистрирован. Используй /register <nick> 👀")
         return
 
-    titles, err = accepted_titles_today(nick)
+    titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
     today = datetime.now(TZ).strftime("%Y-%m-%d")
 
     if err:
@@ -1578,7 +1581,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не нашёл пользователя. Используй /list @username или /list <leetcode_nick>.")
             return
 
-        titles, err = accepted_titles_today(nick)
+        titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
         today = datetime.now(TZ).strftime("%Y-%m-%d")
         if not target.startswith("@"):
             for _tid, uname, lnick in rows:
@@ -1701,10 +1704,10 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = []
 
     for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, day)
         name = profile_label(uname)
         sort_name = (uname or "").lower()
         is_target = mention(uname).lower() == target
+        titles, err = accepted_titles_on_day(nick, day, deep_check=is_target)
         if err:
             items.append((True, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
             continue
@@ -2413,6 +2416,13 @@ def main():
             name="daily_report",
         )
 
+        logger.info(
+            "Scheduled jobs: evening_status=%02d:00, final_reminder=%02d:00, daily_report=%02d:%02d Asia/Almaty",
+            EVENING_STATUS_HOUR,
+            FINAL_REMINDER_HOUR,
+            h,
+            m,
+        )
         logger.info("Catch-up daily reports are disabled; daily report runs only at the scheduled time")
     else:
         logger.info("Challenge automation is disabled; reminders and daily reports are not scheduled")
