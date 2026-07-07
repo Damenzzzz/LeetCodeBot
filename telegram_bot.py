@@ -2253,8 +2253,7 @@ def main():
             name="daily_report",
         )
 
-        # Catch-up once shortly after start (если бот был оффлайн в момент отчёта)
-        app.job_queue.run_once(catchup_job, when=30)
+        logger.info("Catch-up daily reports are disabled; daily report runs only at the scheduled time")
     else:
         logger.info("Challenge automation is disabled; reminders and daily reports are not scheduled")
 
