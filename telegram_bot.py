@@ -76,6 +76,9 @@ LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
 TASK_SLUG_SEP = "||"
+STARTUP_NICK_FIXES = [
+    ("@Jan7378", "ZhanatShengelbay"),
+]
 AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_SEND_TO_OWNER = os.getenv("AUTO_BACKUP_SEND_TO_OWNER", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "20"))
@@ -332,6 +335,14 @@ def remove_user(tid: int):
     conn.close()
 
 
+def update_user_nick(tid: int, nick: str):
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(cur, "UPDATE users SET leetcode_nick=? WHERE telegram_id=?", (nick, int(tid)))
+    conn.commit()
+    conn.close()
+
+
 def list_users():
     conn = db_connect()
     cur = conn.cursor()
@@ -339,6 +350,33 @@ def list_users():
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def find_user_by_telegram_username(username: str):
+    target = mention(username).lower()
+    for tid, uname, nick in list_users():
+        if mention(uname).lower() == target:
+            return int(tid), uname, nick
+    return None
+
+
+def apply_startup_nick_fixes():
+    for username, new_nick in STARTUP_NICK_FIXES:
+        key = f"startup_nick_fix:{mention(username).lower()}:{new_nick.lower()}"
+        if db_get_config(key):
+            continue
+
+        found = find_user_by_telegram_username(username)
+        if not found:
+            logger.warning("Startup nick fix skipped: %s is not registered", username)
+            continue
+
+        tid, uname, old_nick = found
+        if str(old_nick) != str(new_nick):
+            update_user_nick(tid, new_nick)
+            _cache.clear()
+            logger.info("Startup nick fix applied: %s %s -> %s", uname, old_nick, new_nick)
+        db_set_config(key, _now_str())
 
 
 def remember_seen_member(tid: int, username: str, full_name: str, is_bot: bool = False):
@@ -1641,6 +1679,35 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Удалил {target_uname} из бота.", parse_mode="HTML", disable_web_page_preview=True)
 
 
+async def setnick_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    if len(context.args) != 2 or not context.args[0].strip().startswith("@"):
+        await update.message.reply_text("Использование: /setnick @username <leetcode_nick>")
+        return
+
+    target = context.args[0].strip()
+    new_nick = context.args[1].strip()
+    found = find_user_by_telegram_username(target)
+    if not found:
+        await update.message.reply_text("Не нашёл пользователя в базе.")
+        return
+
+    tid, uname, old_nick = found
+    update_user_nick(int(tid), new_nick)
+    _cache.clear()
+    await auto_backup(context, "setnick")
+    await update.message.reply_text(
+        f"✅ Обновил LeetCode nick для {profile_label(uname)}:\n"
+        f"{html_text(old_nick)} → {html_text(new_nick)}",
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     if len(context.args) != 1 or not context.args[0].strip().startswith("@"):
@@ -2128,7 +2195,7 @@ async def daily_report_job(
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Напоминания с тэгами приходят только в 18:00 и 23:00 тем, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет дневной отчёт: тэг только у MVP дня и у тех, кто не решил\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n ⏰ Напоминания с тэгами приходят только в 18:00 и 23:00 тем, кто ещё не решил ни одной задачи\n 🧾 В 00:00 бот отправляет дневной отчёт: тэг только у MVP дня и у тех, кто не решил\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -2159,6 +2226,7 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------- Main -----------------
 def main():
     init_db()
+    apply_startup_nick_fixes()
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         print("ERROR: set TELEGRAM_TOKEN environment variable")
@@ -2178,6 +2246,7 @@ def main():
     app.add_handler(CommandHandler("top", leaderboard))
     app.add_handler(CommandHandler("listtask", listtask))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+    app.add_handler(CommandHandler("setnick", setnick_cmd))
     app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("clearboard", clearboard))
     app.add_handler(CommandHandler("recalculate", recalculate))
