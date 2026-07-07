@@ -2237,7 +2237,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, remember_new_members))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, remember_message_sender))
 
-    if CHALLENGE_AUTOMATION_ENABLED:
+    if CHALLENGE_AUTOMATION_ENABLED or db_get_config("report_chat_id"):
         for reminder_hour in REMINDER_HOURS:
             app.job_queue.run_daily(
                 reminder_job,
