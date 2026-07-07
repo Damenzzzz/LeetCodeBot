@@ -76,9 +76,6 @@ LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
 TASK_SLUG_SEP = "||"
-STARTUP_NICK_FIXES = [
-    ("@Jan7378", "ZhanatShengelbay"),
-]
 AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_SEND_TO_OWNER = os.getenv("AUTO_BACKUP_SEND_TO_OWNER", "1").lower() not in ("0", "false", "no", "off")
 AUTO_BACKUP_KEEP = int(os.getenv("AUTO_BACKUP_KEEP", "20"))
@@ -358,25 +355,6 @@ def find_user_by_telegram_username(username: str):
         if mention(uname).lower() == target:
             return int(tid), uname, nick
     return None
-
-
-def apply_startup_nick_fixes():
-    for username, new_nick in STARTUP_NICK_FIXES:
-        key = f"startup_nick_fix:{mention(username).lower()}:{new_nick.lower()}"
-        if db_get_config(key):
-            continue
-
-        found = find_user_by_telegram_username(username)
-        if not found:
-            logger.warning("Startup nick fix skipped: %s is not registered", username)
-            continue
-
-        tid, uname, old_nick = found
-        if str(old_nick) != str(new_nick):
-            update_user_nick(tid, new_nick)
-            _cache.clear()
-            logger.info("Startup nick fix applied: %s %s -> %s", uname, old_nick, new_nick)
-        db_set_config(key, _now_str())
 
 
 def remember_seen_member(tid: int, username: str, full_name: str, is_bot: bool = False):
@@ -2226,7 +2204,6 @@ async def catchup_job(context: ContextTypes.DEFAULT_TYPE):
 # ----------------- Main -----------------
 def main():
     init_db()
-    apply_startup_nick_fixes()
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         print("ERROR: set TELEGRAM_TOKEN environment variable")
