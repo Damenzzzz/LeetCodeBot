@@ -556,35 +556,6 @@ def award_warn_once(day_str: str, tid: int) -> Tuple[int, bool]:
     return current, awarded
 
 
-def apply_july_8_missed_warns_once():
-    migration_key = "manual_warns_2026_07_08_v1"
-    if db_get_config(migration_key):
-        return
-
-    targets = {"bepatiet", "colldda", "essebba", "futururure", "jan7378"}
-    found = set()
-    for tid, uname, _nick in list_users():
-        normalized = mention(uname).lstrip("@").lower()
-        if normalized not in targets:
-            continue
-        count, awarded = award_warn_once("2026-07-08", int(tid))
-        found.add(normalized)
-        logger.info(
-            "Manual July 8 warning: @%s count=%s awarded=%s",
-            normalized,
-            count,
-            awarded,
-        )
-
-    missing = sorted(targets - found)
-    if missing:
-        logger.warning("Manual July 8 warning users not found: %s", ", ".join(missing))
-        return
-
-    db_set_config(migration_key, "1")
-    logger.info("Manual July 8 warnings completed for all 5 users")
-
-
 def clear_warns(tid: int):
     conn = db_connect()
     cur = conn.cursor()
@@ -2558,7 +2529,6 @@ def main():
     ensure_daily_report_time_config()
     if not acquire_singleton_lock():
         return
-    apply_july_8_missed_warns_once()
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
         print("ERROR: set TELEGRAM_TOKEN environment variable")
