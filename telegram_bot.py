@@ -72,7 +72,7 @@ from telegram.ext import (
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
@@ -217,6 +217,16 @@ def init_db():
 
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS warn_events (
+            day TEXT,
+            telegram_id BIGINT,
+            PRIMARY KEY(day, telegram_id)
+        )
+        """
+    )
+
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS seen_members (
             telegram_id BIGINT PRIMARY KEY,
             username TEXT,
@@ -307,6 +317,24 @@ def ensure_db_schema():
         conn.close()
         db_set_config("db_schema_version", "4")
         current = 4
+
+    # v5: one warning event per participant and challenge day
+    if current < 5:
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS warn_events (
+                day TEXT,
+                telegram_id BIGINT,
+                PRIMARY KEY(day, telegram_id)
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+        db_set_config("db_schema_version", "5")
+        current = 5
 
 
 def db_set_config(key: str, value: str):
@@ -498,6 +526,34 @@ def inc_warn(tid: int) -> int:
     new_count = cur_count + 1
     set_warn_count(tid, new_count)
     return new_count
+
+
+def award_warn_once(day_str: str, tid: int) -> Tuple[int, bool]:
+    """Award at most one warning to a participant for a given challenge day."""
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        "INSERT INTO warn_events(day, telegram_id) VALUES(?, ?) "
+        "ON CONFLICT(day, telegram_id) DO NOTHING",
+        (str(day_str), int(tid)),
+    )
+    awarded = cur.rowcount > 0
+
+    db_execute(cur, "SELECT count FROM warns WHERE telegram_id=?", (int(tid),))
+    row = cur.fetchone()
+    current = int(row[0] or 0) if row else 0
+    if awarded:
+        current += 1
+        db_execute(
+            cur,
+            _upsert_sql("warns", ["telegram_id", "count"], ["telegram_id"]),
+            (int(tid), current),
+        )
+
+    conn.commit()
+    conn.close()
+    return current, awarded
 
 
 def clear_warns(tid: int):
@@ -1954,6 +2010,48 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await maybe_set_group_chat(update)
+    rows = list_users()
+    if not rows:
+        await update.message.reply_text("Список участников пуст.")
+        return
+
+    if context.args:
+        if len(context.args) != 1:
+            await update.message.reply_text("Использование: /warns или /warns @username")
+            return
+        target = context.args[0].strip()
+        found = find_user_by_telegram_username(target) if target.startswith("@") else None
+        if found is None:
+            for tid, uname, nick in rows:
+                if str(nick).lower() == target.lower():
+                    found = (int(tid), uname, nick)
+                    break
+        if found is None:
+            await update.message.reply_text("Не нашёл пользователя в базе.")
+            return
+        tid, uname, _nick = found
+        await update.message.reply_text(
+            f"⚠️ {profile_label(uname)} — {get_warn_count(int(tid))}/3 warnings",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    result = [
+        (get_warn_count(int(tid)), (uname or "").lower(), profile_label(uname))
+        for tid, uname, _nick in rows
+    ]
+    result.sort(key=lambda item: (-item[0], item[1]))
+    lines = [f"{name} — {count}/3" for count, _sort_name, name in result]
+    await update.message.reply_text(
+        "⚠️ Предупреждения участников:\n\n" + "\n".join(lines),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
 async def tagunregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     chat = update.effective_chat
@@ -2290,8 +2388,7 @@ async def daily_report_job(
 
     day = target_day or datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
-    warns_key = f"warns_applied_{day_str}"
-    should_apply_warns = apply_warns and not bool(db_get_config(warns_key))
+    should_apply_warns = apply_warns
 
     items = []  # (had_error, cnt, profile_name, tagged_name, sort_name, warn_count)
     mvp_max = -1
@@ -2317,8 +2414,8 @@ async def daily_report_job(
         warn_count = None
         kicked = False
         if should_apply_warns and cnt == 0:
-            warn_count = inc_warn(int(tid))
-            if warn_count >= 3:
+            warn_count, warn_awarded = award_warn_once(day_str, int(tid))
+            if warn_awarded and warn_count >= 3:
                 # Kick from group (ban+unban), requires bot admin rights.
                 try:
                     await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(tid))
@@ -2364,13 +2461,41 @@ async def daily_report_job(
     header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await send_report_message(context, chat_id, text)
-    if should_apply_warns:
-        db_set_config(warns_key, "1")
     _set_last_report_day(day_str)
     await auto_backup(context, f"daily_report_{day_str}")
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    text = "ℹ️ *Информация о боте*\n\n Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n *Как начать:*\n 1️⃣Каждый участник пишет /register <leetcode_nick>\n\n *Команды:*\n • /register <nick> — зарегистрировать LeetCode ник\n • /unregister — удалить себя из бота\n • /check — сколько и какие задачи *ты* решил сегодня\n • /list — статус всех за сегодня (кол-во + ✅/❌)\n • /list @user — какие задачи решил пользователь сегодня\n • /leaderboard или /top — рейтинг по баллам: Easy=1, Medium=3, Hard=5\n • /week — статистика с понедельника\n • /week @user — статистика пользователя с понедельника\n • /info — эта справка\n\n *Админ-команды:*\n • /setgroup — включить авто-отчёты в текущем чате/топике\n • /cleargroup — отключить авто-отчёты и напоминания\n • /setnick @user <nick> — исправить LeetCode ник участника\n • /unwarn @user — сбросить предупреждения одному участнику\n • /unwarn all — сбросить предупреждения всем\n\n *Авто-логика:*\n 📋 В 18:00 бот отправляет общий статус: кто сколько задач решил сегодня\n ⏰ В 23:00 бот тэгнет только тех, кто ещё не решил ни одной задачи\n 🧾 В 23:59 бот отправляет итог дня: тэг только у MVP дня и у тех, кто не решил\n ⚠️ 3 пропущенных дня за челлендж — 3/3 предупреждения и kick из группы\n 🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n Правило простое: *1 задача в день — и ты красавчик* 😎"
+    text = (
+        "ℹ️ *Информация о боте*\n\n"
+        "Я слежу за тем, чтобы каждый решал *минимум 1 задачу в день* на LeetCode 💪\n\n"
+        "*Как начать:*\n"
+        "1️⃣ Каждый участник пишет /register <leetcode_nick>\n\n"
+        "*Команды:*\n"
+        "• /register <nick> — зарегистрировать LeetCode ник\n"
+        "• /unregister — удалить себя из бота\n"
+        "• /check — сколько и какие задачи *ты* решил сегодня\n"
+        "• /list — статус всех за сегодня (кол-во + ✅/❌)\n"
+        "• /list @user — какие задачи решил пользователь сегодня\n"
+        "• /leaderboard или /top — рейтинг: Easy=1, Medium=3, Hard=5\n"
+        "• /week — статистика с понедельника\n"
+        "• /week @user — статистика пользователя с понедельника\n"
+        "• /warns — предупреждения всех участников\n"
+        "• /warns @user — предупреждения одного участника\n"
+        "• /info — эта справка\n\n"
+        "*Админ-команды:*\n"
+        "• /setgroup — включить авто-отчёты в текущем чате/топике\n"
+        "• /cleargroup — отключить авто-отчёты и напоминания\n"
+        "• /setnick @user <nick> — исправить LeetCode ник участника\n"
+        "• /unwarn @user — сбросить предупреждения одному участнику\n"
+        "• /unwarn all — сбросить предупреждения всем\n\n"
+        "*Авто-логика:*\n"
+        "📋 В 18:00 бот отправляет общий статус\n"
+        "⏰ В 23:00 бот тэгнет тех, кто ещё не решил ни одной задачи\n"
+        "🧾 В 23:59 бот отправляет итог дня и начисляет по одному warning за пропуск\n"
+        "⚠️ 3 пропущенных дня за челлендж — 3/3 warnings и kick из группы\n"
+        "🎉 Как только *все* решат ≥1 задачу — бот поздравит группу\n\n"
+        "Правило простое: *1 задача в день — и ты красавчик* 😎"
+    )
     try:
         await update.message.reply_text(text, parse_mode="Markdown")
     except Exception:
@@ -2429,6 +2554,7 @@ def main():
     app.add_handler(CommandHandler("recalculate", recalculate))
     app.add_handler(CommandHandler("recheckday", recheckday))
     app.add_handler(CommandHandler("settime", settime))  # owner-only
+    app.add_handler(CommandHandler("warns", warns))
     app.add_handler(CommandHandler("unwarn", unwarn))  # owner-only
     app.add_handler(CommandHandler("tagunregistered", tagunregistered))  # hidden admin-only
     app.add_handler(CommandHandler("info", info))
