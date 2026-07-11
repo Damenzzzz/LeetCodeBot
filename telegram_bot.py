@@ -379,6 +379,10 @@ def remove_user(tid: int):
     conn = db_connect()
     cur = conn.cursor()
     db_execute(cur, "DELETE FROM users WHERE telegram_id=?", (tid,))
+    db_execute(cur, "DELETE FROM warns WHERE telegram_id=?", (tid,))
+    db_execute(cur, "DELETE FROM warn_events WHERE telegram_id=?", (tid,))
+    db_execute(cur, "DELETE FROM leaderboard WHERE telegram_id=?", (tid,))
+    db_execute(cur, "DELETE FROM daily_stats WHERE telegram_id=?", (tid,))
     conn.commit()
     conn.close()
 
@@ -399,6 +403,65 @@ def list_users():
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def _inactive_member_statuses() -> set:
+    return {
+        getattr(ChatMember, "LEFT", "left"),
+        getattr(ChatMember, "BANNED", "kicked"),
+        "left",
+        "kicked",
+    }
+
+
+async def prune_inactive_users(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: Optional[int] = None,
+    rows: Optional[List[Tuple[int, str, str]]] = None,
+    reason: str = "manual",
+):
+    """
+    Remove registered users who are no longer in the Telegram group.
+    Keeps /list, /leaderboard, /week and scheduled reports aligned with the real chat.
+    """
+    rows = rows if rows is not None else list_users()
+    if not rows:
+        return []
+
+    if chat_id is None:
+        chat_id_raw = db_get_config("report_chat_id")
+        chat_id = int(chat_id_raw) if chat_id_raw else None
+    if chat_id is None:
+        return rows
+
+    inactive_statuses = _inactive_member_statuses()
+    active_rows = []
+    removed = []
+
+    for tid, uname, nick in rows:
+        try:
+            member = await context.bot.get_chat_member(chat_id=chat_id, user_id=int(tid))
+            if member.status in inactive_statuses:
+                remove_user(int(tid))
+                removed.append(profile_label(uname))
+                logger.info("Pruned inactive user %s (%s), status=%s", uname, tid, member.status)
+            else:
+                active_rows.append((tid, uname, nick))
+        except Exception as e:
+            logger.warning("Could not check group membership for %s (%s): %s", uname, tid, e)
+            active_rows.append((tid, uname, nick))
+
+    if removed:
+        await auto_backup(context, f"prune_inactive_{reason}")
+
+    return active_rows
+
+
+def membership_chat_id_from_update(update: Update) -> Optional[int]:
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        return int(chat.id)
+    return None
 
 
 def find_user_by_telegram_username(username: str):
@@ -1553,7 +1616,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /check @user — задачи указанного пользователя сегодня.
     /check <leetcode_nick> — задачи по нику LeetCode.
     """
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "check")
     if not rows:
         await update.message.reply_text("Список пуст. Кто первый: /register <nick> 😄")
         return
@@ -1644,7 +1707,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /list — ДЛЯ ВСЕХ: статус всех сегодня (кол-во задач + ✅/❌)
     /list @user — ДЛЯ ВСЕХ: задачи пользователя сегодня
     """
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "list")
     if not rows:
         await update.message.reply_text("Список пуст. Кто первый: /register <nick> ")
         return
@@ -1738,7 +1801,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "leaderboard")
     if not rows:
         await update.message.reply_text("Пока нет зарегистрированных. /register <nick>")
         return
@@ -1778,7 +1841,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "listtask")
     if not rows:
         await update.message.reply_text("Список пуст. Кто первый: /register <nick> 😄")
         return
@@ -1837,7 +1900,7 @@ async def removeuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = context.args[0].strip()
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "removeuser")
 
     target_tid = None
     target_uname = None
@@ -1902,7 +1965,7 @@ async def who(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     target = context.args[0].strip().lower()
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "who")
     for _tid, uname, nick in rows:
         if mention(uname).lower() == target:
             nick = normalize_leetcode_nick(nick)
@@ -1978,7 +2041,7 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Предупреждения сброшены для всех участников.")
         return
 
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "unwarn")
 
     target_tid = None
     target_name = None
@@ -2012,7 +2075,7 @@ async def unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "warns")
     if not rows:
         await update.message.reply_text("Список участников пуст.")
         return
@@ -2155,7 +2218,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Неверная дата. Формат: YYYY-MM-DD")
         return
 
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "recheckday")
     if not rows:
         await update.message.reply_text("Пока нет зарегистрированных пользователей.")
         return
@@ -2188,7 +2251,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /week — totals for everyone from Monday to today.
     /week @user — breakdown for one user from Monday to today.
     """
-    rows = list_users()
+    rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "week")
     if not rows:
         await update.message.reply_text("Пока нет зарегистрированных. /register <nick>")
         return
@@ -2273,7 +2336,7 @@ async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = int(chat_id_raw)
 
-    rows = list_users()
+    rows = await prune_inactive_users(context, chat_id, list_users(), "evening_status")
     if not rows:
         logger.info("Evening status skipped: no users registered")
         return
@@ -2321,7 +2384,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = int(chat_id_raw)
 
-    rows = list_users()
+    rows = await prune_inactive_users(context, chat_id, list_users(), "reminder")
     if not rows:
         logger.info("Reminder skipped: no users registered")
         return
@@ -2381,7 +2444,7 @@ async def daily_report_job(
         return
     chat_id = int(chat_id)
 
-    rows = list_users()
+    rows = await prune_inactive_users(context, chat_id, list_users(), "daily_report")
     if not rows:
         await send_report_message(context, chat_id, "Сегодня никого не было в списке 😄")
         return
@@ -2420,6 +2483,7 @@ async def daily_report_job(
                 try:
                     await context.bot.ban_chat_member(chat_id=chat_id, user_id=int(tid))
                     await context.bot.unban_chat_member(chat_id=chat_id, user_id=int(tid))
+                    remove_user(int(tid))
                     kicked = True
                 except Exception as e:
                     logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
@@ -2486,6 +2550,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /setgroup — включить авто-отчёты в текущем чате/топике\n"
         "• /cleargroup — отключить авто-отчёты и напоминания\n"
         "• /setnick @user <nick> — исправить LeetCode ник участника\n"
+        "• /removeuser @user — удалить участника из списка бота\n"
         "• /unwarn @user — сбросить предупреждения одному участнику\n"
         "• /unwarn all — сбросить предупреждения всем\n\n"
         "*Авто-логика:*\n"
@@ -2548,6 +2613,7 @@ def main():
     app.add_handler(CommandHandler("top", leaderboard))
     app.add_handler(CommandHandler("listtask", listtask))
     app.add_handler(CommandHandler("removeuser", removeuser_cmd))
+    app.add_handler(CommandHandler("remove", removeuser_cmd))
     app.add_handler(CommandHandler("setnick", setnick_cmd))
     app.add_handler(CommandHandler("who", who))
     app.add_handler(CommandHandler("clearboard", clearboard))
