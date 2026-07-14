@@ -50,6 +50,10 @@ import sqlite3
 import logging
 import html
 import re
+import asyncio
+import random
+import threading
+import time as time_module
 from datetime import datetime, date, timedelta, time
 from zoneinfo import ZoneInfo
 from typing import Optional, Tuple, List, Dict, Any
@@ -59,6 +63,10 @@ try:
     import psycopg
 except ImportError:
     psycopg = None
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:
+    ConnectionPool = None
 from telegram import Update, ChatMember
 from telegram.ext import (
     ApplicationBuilder,
@@ -72,7 +80,7 @@ from telegram.ext import (
 DB_PATH = os.getenv("DB_PATH", "leetcode_bot.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 USE_POSTGRES = bool(DATABASE_URL)
-DB_SCHEMA_VERSION = 5
+DB_SCHEMA_VERSION = 6
 LEETCODE_GRAPHQL = "https://leetcode.com/graphql"
 TZ = ZoneInfo("Asia/Almaty")
 LEETCODE_RECENT_ACCEPTED_LIMIT = int(os.getenv("LEETCODE_RECENT_ACCEPTED_LIMIT", "100"))
@@ -88,6 +96,12 @@ EVENING_STATUS_HOUR = 18
 FINAL_REMINDER_HOUR = 23
 CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
 DEEP_CACHE_TTL_SECONDS = 10 * 60
+DAILY_SNAPSHOT_TTL_SECONDS = int(os.getenv("DAILY_SNAPSHOT_TTL_SECONDS", "300"))
+LEETCODE_MAX_CONCURRENCY = max(1, int(os.getenv("LEETCODE_MAX_CONCURRENCY", "4")))
+LEETCODE_HTTP_TIMEOUT = float(os.getenv("LEETCODE_HTTP_TIMEOUT", "15"))
+LEETCODE_RETRY_ATTEMPTS = max(1, int(os.getenv("LEETCODE_RETRY_ATTEMPTS", "3")))
+PG_POOL_MIN_SIZE = max(0, int(os.getenv("PG_POOL_MIN_SIZE", "1")))
+PG_POOL_MAX_SIZE = max(PG_POOL_MIN_SIZE or 1, int(os.getenv("PG_POOL_MAX_SIZE", "5")))
 CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
 
 ADMIN_IDS = {int(x) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip().isdigit()}  # optional
@@ -98,17 +112,66 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# in-memory cache: (nick, yyyy-mm-dd) -> (titles_list, fetched_at_epoch_seconds)
-_cache: Dict[Tuple[str, str], Tuple[List[str], float]] = {}
+# in-memory cache: (nick, yyyy-mm-dd, deep_check) -> (titles_list, fetched_at_epoch_seconds)
+_cache: Dict[Tuple[str, str, bool], Tuple[List[str], float]] = {}
 _singleton_lock_conn = None
+_pg_pool = None
+_leetcode_semaphore: Optional[asyncio.Semaphore] = None
+_leetcode_semaphore_loop = None
+_thread_local = threading.local()
+_background_refreshes: Dict[str, float] = {}
 
 
 # ----------------- DB helpers -----------------
+class _PooledConnection:
+    """Small adapter so existing conn.close() calls return Postgres connections to the pool."""
+
+    def __init__(self, context_manager):
+        self._context_manager = context_manager
+        self._conn = context_manager.__enter__()
+        self._closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        if not self._closed:
+            self._context_manager.__exit__(None, None, None)
+            self._closed = True
+
+
+def _get_pg_pool():
+    global _pg_pool
+    if not USE_POSTGRES:
+        return None
+    if ConnectionPool is None:
+        return None
+    if _pg_pool is None:
+        _pg_pool = ConnectionPool(
+            DATABASE_URL,
+            min_size=PG_POOL_MIN_SIZE,
+            max_size=PG_POOL_MAX_SIZE,
+            open=True,
+        )
+        try:
+            _pg_pool.wait(timeout=10)
+        except Exception as e:
+            logger.warning("Postgres pool startup check failed: %s", e)
+    return _pg_pool
+
+
+def _postgres_direct_connect():
+    if psycopg is None:
+        raise RuntimeError("DATABASE_URL is set, but psycopg is not installed")
+    return psycopg.connect(DATABASE_URL)
+
+
 def db_connect():
     if USE_POSTGRES:
-        if psycopg is None:
-            raise RuntimeError("DATABASE_URL is set, but psycopg is not installed")
-        return psycopg.connect(DATABASE_URL)
+        pool = _get_pg_pool()
+        if pool is not None:
+            return _PooledConnection(pool.connection())
+        return _postgres_direct_connect()
     return sqlite3.connect(DB_PATH)
 
 
@@ -127,7 +190,8 @@ def acquire_singleton_lock() -> bool:
     if not USE_POSTGRES:
         return True
 
-    conn = db_connect()
+    # This lock must live on a dedicated connection for the whole process lifetime.
+    conn = _postgres_direct_connect()
     cur = conn.cursor()
     logger.info("Waiting for singleton lock")
     cur.execute("SELECT pg_advisory_lock(8441710556)")
@@ -190,6 +254,7 @@ def init_db():
             telegram_id BIGINT,
             solved_count INTEGER,
             titles_json TEXT,
+            fetched_at BIGINT DEFAULT 0,
             PRIMARY KEY(day, telegram_id)
         )
         """
@@ -236,11 +301,56 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS problem_cache (
+            title_slug TEXT PRIMARY KEY,
+            difficulty TEXT,
+            fetched_at BIGINT
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
     ensure_db_schema()
 
+
+def db_column_exists(table: str, column: str) -> bool:
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        if USE_POSTGRES:
+            db_execute(
+                cur,
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name=? AND column_name=?
+                LIMIT 1
+                """,
+                (table, column),
+            )
+            return cur.fetchone() is not None
+
+        cur.execute(f"PRAGMA table_info({table})")
+        return any(str(row[1]) == column for row in cur.fetchall())
+    finally:
+        conn.close()
+
+
+def db_add_column_if_missing(table: str, column: str, column_sql: str):
+    if db_column_exists(table, column):
+        return
+
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {column_sql}")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def ensure_db_schema():
@@ -335,6 +445,26 @@ def ensure_db_schema():
         conn.close()
         db_set_config("db_schema_version", "5")
         current = 5
+
+    # v6: persistent LeetCode problem difficulty cache and snapshot freshness timestamps
+    if current < 6:
+        db_add_column_if_missing("daily_stats", "fetched_at", "fetched_at BIGINT DEFAULT 0")
+
+        conn = db_connect()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS problem_cache (
+                title_slug TEXT PRIMARY KEY,
+                difficulty TEXT,
+                fetched_at BIGINT
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+        db_set_config("db_schema_version", "6")
+        current = 6
 
 
 def db_set_config(key: str, value: str):
@@ -500,11 +630,53 @@ def save_daily_stats(day: str, tid: int, solved_count: int, titles: List[str]):
     cur = conn.cursor()
     db_execute(
         cur,
-        _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
-        (day, tid, int(solved_count), json.dumps(titles, ensure_ascii=False)),
+        _upsert_sql(
+            "daily_stats",
+            ["day", "telegram_id", "solved_count", "titles_json", "fetched_at"],
+            ["day", "telegram_id"],
+        ),
+        (day, tid, int(solved_count), json.dumps(titles, ensure_ascii=False), int(time_module.time())),
     )
     conn.commit()
     conn.close()
+
+
+def get_daily_snapshot(day: str, tid: int, max_age_seconds: Optional[int] = None):
+    conn = db_connect()
+    cur = conn.cursor()
+    try:
+        db_execute(
+            cur,
+            "SELECT solved_count, titles_json, fetched_at FROM daily_stats WHERE day=? AND telegram_id=?",
+            (str(day), int(tid)),
+        )
+        row = cur.fetchone()
+    except Exception:
+        conn.close()
+        return None
+    conn.close()
+
+    if not row:
+        return None
+
+    solved_count, titles_json, fetched_at = row
+    fetched_at = int(fetched_at or 0)
+    if max_age_seconds is not None:
+        if not fetched_at or (time_module.time() - fetched_at) > max_age_seconds:
+            return None
+
+    try:
+        titles = json.loads(titles_json or "[]")
+        if not isinstance(titles, list):
+            titles = []
+    except Exception:
+        titles = []
+
+    return {
+        "solved_count": int(solved_count or len(titles)),
+        "titles": titles,
+        "fetched_at": fetched_at,
+    }
 
 def _points_for_difficulty(diff: str) -> int:
     d = (diff or "").strip().upper()
@@ -653,11 +825,17 @@ def collect_backup_data() -> Dict[str, Any]:
         for tid, uname, nick in cur.fetchall()
     ]
 
-    cur.execute("SELECT day, telegram_id, solved_count, titles_json FROM daily_stats")
+    cur.execute("SELECT day, telegram_id, solved_count, titles_json, fetched_at FROM daily_stats")
     stats_rows = []
-    for day, tid, cnt, titles_json in cur.fetchall():
+    for day, tid, cnt, titles_json, fetched_at in cur.fetchall():
         stats_rows.append(
-            {"day": str(day), "telegram_id": int(tid), "solved_count": int(cnt or 0), "titles_json": titles_json or "[]"}
+            {
+                "day": str(day),
+                "telegram_id": int(tid),
+                "solved_count": int(cnt or 0),
+                "titles_json": titles_json or "[]",
+                "fetched_at": int(fetched_at or 0),
+            }
         )
 
     cur.execute("SELECT key, value FROM config")
@@ -669,10 +847,19 @@ def collect_backup_data() -> Dict[str, Any]:
     cur.execute("SELECT telegram_id, count FROM warns")
     warns_rows = [{"telegram_id": int(tid), "count": int(c or 0)} for tid, c in cur.fetchall()]
 
+    cur.execute("SELECT day, telegram_id FROM warn_events")
+    warn_events_rows = [{"day": str(day), "telegram_id": int(tid)} for day, tid in cur.fetchall()]
+
     cur.execute("SELECT telegram_id, username, full_name, is_bot FROM seen_members")
     seen_members_rows = [
         {"telegram_id": int(tid), "username": str(uname or ""), "full_name": str(full_name or ""), "is_bot": int(is_bot or 0)}
         for tid, uname, full_name, is_bot in cur.fetchall()
+    ]
+
+    cur.execute("SELECT title_slug, difficulty, fetched_at FROM problem_cache")
+    problem_cache_rows = [
+        {"title_slug": str(slug), "difficulty": str(diff or "UNKNOWN"), "fetched_at": int(fetched_at or 0)}
+        for slug, diff, fetched_at in cur.fetchall()
     ]
 
     conn.close()
@@ -686,7 +873,9 @@ def collect_backup_data() -> Dict[str, Any]:
             "config": config_rows,
             "leaderboard": leaderboard_rows,
             "warns": warns_rows,
+            "warn_events": warn_events_rows,
             "seen_members": seen_members_rows,
+            "problem_cache": problem_cache_rows,
         },
     }
 
@@ -873,8 +1062,18 @@ def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, t
 
     db_execute(
         cur,
-        _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
-        (day_str, int(tid), int(solved_count_final), json.dumps(merged_titles, ensure_ascii=False)),
+        _upsert_sql(
+            "daily_stats",
+            ["day", "telegram_id", "solved_count", "titles_json", "fetched_at"],
+            ["day", "telegram_id"],
+        ),
+        (
+            day_str,
+            int(tid),
+            int(solved_count_final),
+            json.dumps(merged_titles, ensure_ascii=False),
+            int(time_module.time()),
+        ),
     )
 
     conn.commit()
@@ -950,6 +1149,45 @@ def nick_escape(s: str) -> str:
     return s.replace('"', '\\"')
 
 
+def _requests_session() -> requests.Session:
+    session = getattr(_thread_local, "requests_session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update(
+            {
+                "Content-Type": "application/json",
+                "User-Agent": "leetcode-telegram-bot/1.0",
+            }
+        )
+        _thread_local.requests_session = session
+    return session
+
+
+def leetcode_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    last_err = None
+    payload = {"query": query, "variables": variables or {}}
+
+    for attempt in range(LEETCODE_RETRY_ATTEMPTS):
+        try:
+            resp = _requests_session().post(
+                LEETCODE_GRAPHQL,
+                json=payload,
+                timeout=LEETCODE_HTTP_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errors"):
+                raise RuntimeError(data["errors"])
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt + 1 < LEETCODE_RETRY_ATTEMPTS:
+                delay = min(4.0, 0.35 * (2 ** attempt)) + random.uniform(0, 0.15)
+                time_module.sleep(delay)
+
+    raise last_err
+
+
 def leetcode_recent_accepted_submissions(nick: str):
     nick = normalize_leetcode_nick(nick)
     q = """
@@ -961,25 +1199,8 @@ def leetcode_recent_accepted_submissions(nick: str):
       }
     }
     """
-    last_err = None
-    for _attempt in range(3):
-        try:
-            resp = requests.post(
-                LEETCODE_GRAPHQL,
-                json={
-                    "query": q,
-                    "variables": {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT},
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("errors"):
-                raise RuntimeError(data["errors"])
-            return data.get("data", {}).get("recentAcSubmissionList") or []
-        except Exception as e:
-            last_err = e
-    raise last_err
+    data = leetcode_graphql_request(q, {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT})
+    return data.get("data", {}).get("recentAcSubmissionList") or []
 
 
 def leetcode_recent_submissions(nick: str):
@@ -994,25 +1215,8 @@ def leetcode_recent_submissions(nick: str):
       }
     }
     """
-    last_err = None
-    for _attempt in range(3):
-        try:
-            resp = requests.post(
-                LEETCODE_GRAPHQL,
-                json={
-                    "query": q,
-                    "variables": {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT},
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("errors"):
-                raise RuntimeError(data["errors"])
-            return data.get("data", {}).get("recentSubmissionList") or []
-        except Exception as e:
-            last_err = e
-    raise last_err
+    data = leetcode_graphql_request(q, {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT})
+    return data.get("data", {}).get("recentSubmissionList") or []
 
 
 def leetcode_user_exists(nick: str) -> bool:
@@ -1024,15 +1228,7 @@ def leetcode_user_exists(nick: str) -> bool:
       }
     }
     """
-    resp = requests.post(
-        LEETCODE_GRAPHQL,
-        json={"query": q, "variables": {"username": nick}},
-        timeout=15,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("errors"):
-        raise RuntimeError(data["errors"])
+    data = leetcode_graphql_request(q, {"username": nick})
     return bool((data.get("data") or {}).get("matchedUser"))
 
 
@@ -1072,6 +1268,43 @@ def _accepted_titles_from_submissions(subs: List[Dict[str, Any]], target_day: da
 
 
 
+def get_cached_problem_difficulty(title_slug: str, max_age_seconds: int) -> Optional[str]:
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(cur, "SELECT difficulty, fetched_at FROM problem_cache WHERE title_slug=?", (title_slug,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    diff, fetched_at = row
+    fetched_at = int(fetched_at or 0)
+    if not fetched_at or (time_module.time() - fetched_at) > max_age_seconds:
+        return None
+
+    diff_up = str(diff or "").upper()
+    return diff_up if diff_up in ("EASY", "MEDIUM", "HARD") else None
+
+
+def set_cached_problem_difficulty(title_slug: str, difficulty: str):
+    if not title_slug:
+        return
+    diff_up = str(difficulty or "UNKNOWN").upper()
+    if diff_up not in ("EASY", "MEDIUM", "HARD"):
+        diff_up = "UNKNOWN"
+
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        _upsert_sql("problem_cache", ["title_slug", "difficulty", "fetched_at"], ["title_slug"]),
+        (title_slug, diff_up, int(time_module.time())),
+    )
+    conn.commit()
+    conn.close()
+
+
 # difficulty cache: titleSlug -> (DIFFICULTY, fetched_at_epoch)
 _diff_cache: Dict[str, Tuple[str, float]] = {}
 _DIFF_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h
@@ -1087,11 +1320,14 @@ def leetcode_question_difficulty(title_slug: Optional[str]) -> str:
     if cached and (now_ts - cached[1] < _DIFF_CACHE_TTL_SECONDS):
         return cached[0]
 
+    cached_db = get_cached_problem_difficulty(title_slug, _DIFF_CACHE_TTL_SECONDS)
+    if cached_db:
+        _diff_cache[title_slug] = (cached_db, now_ts)
+        return cached_db
+
     q = '{ question(titleSlug: "%s") { difficulty } }' % nick_escape(title_slug)
     try:
-        resp = requests.post(LEETCODE_GRAPHQL, json={"query": q}, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = leetcode_graphql_request(q)
         diff = (data.get("data", {}).get("question", {}) or {}).get("difficulty") or "UNKNOWN"
     except Exception as e:
         logger.exception("LeetCode difficulty fetch error for %s: %s", title_slug, e)
@@ -1101,6 +1337,7 @@ def leetcode_question_difficulty(title_slug: Optional[str]) -> str:
     if diff_up not in ("EASY", "MEDIUM", "HARD"):
         diff_up = "UNKNOWN"
     _diff_cache[title_slug] = (diff_up, now_ts)
+    set_cached_problem_difficulty(title_slug, diff_up)
     return diff_up
 
 
@@ -1149,6 +1386,112 @@ def accepted_titles_on_day(nick: str, target_day: date, deep_check: bool = False
 
 def accepted_titles_today(nick: str) -> Tuple[Optional[List[str]], Optional[str]]:
     return accepted_titles_on_day(nick, datetime.now(TZ).date())
+
+
+def _get_leetcode_semaphore() -> asyncio.Semaphore:
+    global _leetcode_semaphore, _leetcode_semaphore_loop
+    loop = asyncio.get_running_loop()
+    if _leetcode_semaphore is None or _leetcode_semaphore_loop is not loop:
+        _leetcode_semaphore = asyncio.Semaphore(LEETCODE_MAX_CONCURRENCY)
+        _leetcode_semaphore_loop = loop
+    return _leetcode_semaphore
+
+
+async def accepted_titles_on_day_async(
+    nick: str,
+    target_day: date,
+    deep_check: bool = False,
+) -> Tuple[Optional[List[str]], Optional[str]]:
+    async with _get_leetcode_semaphore():
+        return await asyncio.to_thread(accepted_titles_on_day, nick, target_day, deep_check)
+
+
+async def accepted_titles_today_async(nick: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    return await accepted_titles_on_day_async(nick, datetime.now(TZ).date())
+
+
+async def get_titles_for_user_on_day(
+    tid: int,
+    nick: str,
+    target_day: date,
+    deep_check: bool = False,
+    prefer_snapshot: bool = True,
+) -> Tuple[Optional[List[str]], Optional[str], bool]:
+    day_str = target_day.strftime("%Y-%m-%d")
+    if prefer_snapshot:
+        snapshot = get_daily_snapshot(day_str, int(tid), DAILY_SNAPSHOT_TTL_SECONDS)
+        if snapshot is not None:
+            titles = snapshot["titles"]
+            if not (deep_check and not titles):
+                return titles, None, True
+
+    titles, err = await accepted_titles_on_day_async(nick, target_day, deep_check=deep_check)
+    return titles, err, False
+
+
+def _snapshot_is_fresh(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not snapshot:
+        return False
+    fetched_at = int(snapshot.get("fetched_at") or 0)
+    return bool(fetched_at and (time_module.time() - fetched_at) <= DAILY_SNAPSHOT_TTL_SECONDS)
+
+
+async def refresh_day_snapshots_background(
+    rows: List[Tuple[int, str, str]],
+    target_day: date,
+    refresh_key: str,
+):
+    day_str = target_day.strftime("%Y-%m-%d")
+    started = time_module.time()
+    try:
+        checks = await asyncio.gather(
+            *[accepted_titles_on_day_async(nick, target_day) for _tid, _uname, nick in rows],
+            return_exceptions=True,
+        )
+
+        updated = 0
+        errors = 0
+        for (tid, _uname, nick), result in zip(rows, checks):
+            if isinstance(result, Exception):
+                errors += 1
+                logger.warning("Background /list refresh failed for %s: %s", nick, result)
+                continue
+
+            titles, err = result
+            if err:
+                errors += 1
+                logger.warning("Background /list refresh got LeetCode error for %s: %s", nick, err)
+                continue
+
+            try:
+                update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
+                updated += 1
+            except Exception as e:
+                errors += 1
+                logger.warning("Background /list snapshot update failed for %s: %s", nick, e)
+
+        logger.info(
+            "Background /list refresh finished for %s: updated=%s errors=%s elapsed=%.2fs",
+            day_str,
+            updated,
+            errors,
+            time_module.time() - started,
+        )
+    finally:
+        _background_refreshes.pop(refresh_key, None)
+
+
+def schedule_day_snapshot_refresh(context: ContextTypes.DEFAULT_TYPE, rows, target_day: date, reason: str) -> bool:
+    day_str = target_day.strftime("%Y-%m-%d")
+    refresh_key = f"{reason}:{day_str}"
+    now_ts = time_module.time()
+    started_at = _background_refreshes.get(refresh_key)
+    if started_at and (now_ts - started_at) < 120:
+        return False
+
+    _background_refreshes[refresh_key] = now_ts
+    context.application.create_task(refresh_day_snapshots_background(list(rows), target_day, refresh_key))
+    return True
 
 
 def mention(uname: str) -> str:
@@ -1360,7 +1703,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     config_rows = data.get("config")
     leaderboard_rows = data.get("leaderboard")
     warns_rows = data.get("warns")
+    warn_events_rows = data.get("warn_events")
     seen_members_rows = data.get("seen_members")
+    problem_cache_rows = data.get("problem_cache")
 
     if isinstance(data.get("tables"), dict):
         t = data["tables"]
@@ -1369,7 +1714,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         config_rows = config_rows or t.get("config")
         leaderboard_rows = leaderboard_rows or t.get("leaderboard")
         warns_rows = warns_rows or t.get("warns")
+        warn_events_rows = warn_events_rows or t.get("warn_events")
         seen_members_rows = seen_members_rows or t.get("seen_members")
+        problem_cache_rows = problem_cache_rows or t.get("problem_cache")
 
     if users_rows is None and stats_rows is None and config_rows is None:
         await update.message.reply_text("⚠️ Это не похоже на бэкап (нет users/daily_stats/config).")
@@ -1388,7 +1735,9 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur.execute("DELETE FROM config")
         cur.execute("DELETE FROM leaderboard")
         cur.execute("DELETE FROM warns")
+        cur.execute("DELETE FROM warn_events")
         cur.execute("DELETE FROM seen_members")
+        cur.execute("DELETE FROM problem_cache")
 
         # Restore config
         if config_rows:
@@ -1403,7 +1752,11 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), (str(k), str(v)))
 
         # Record schema version
-        db_execute(cur, _upsert_sql("config", ["key", "value"], ["key"]), ("db_schema_version", str(schema_version)))
+        db_execute(
+            cur,
+            _upsert_sql("config", ["key", "value"], ["key"]),
+            ("db_schema_version", str(max(schema_version, DB_SCHEMA_VERSION))),
+        )
 
         # Restore users
         users_count = 0
@@ -1436,8 +1789,12 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
                 db_execute(
                     cur,
-                    _upsert_sql("daily_stats", ["day", "telegram_id", "solved_count", "titles_json"], ["day", "telegram_id"]),
-                    (str(day), int(tid), int(cnt), titles_json or "[]"),
+                    _upsert_sql(
+                        "daily_stats",
+                        ["day", "telegram_id", "solved_count", "titles_json", "fetched_at"],
+                        ["day", "telegram_id"],
+                    ),
+                    (str(day), int(tid), int(cnt), titles_json or "[]", int(row.get("fetched_at") or 0)),
                 )
                 stats_count += 1
 
@@ -1473,6 +1830,19 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (int(tid), int(c)),
                 )
 
+        # Restore warning idempotency events (optional)
+        if warn_events_rows:
+            for row in warn_events_rows:
+                day = row.get("day")
+                tid = row.get("telegram_id") or row.get("tid")
+                if day is None or tid is None:
+                    continue
+                db_execute(
+                    cur,
+                    _upsert_sql("warn_events", ["day", "telegram_id"], ["day", "telegram_id"]),
+                    (str(day), int(tid)),
+                )
+
         # Restore seen members (optional)
         if seen_members_rows:
             for row in seen_members_rows:
@@ -1488,6 +1858,21 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     (int(tid), str(uname), str(full_name), int(is_bot)),
                 )
 
+        # Restore LeetCode problem difficulty cache (optional)
+        if problem_cache_rows:
+            for row in problem_cache_rows:
+                slug = row.get("title_slug") or row.get("slug")
+                if not slug:
+                    continue
+                diff = str(row.get("difficulty") or "UNKNOWN").upper()
+                if diff not in ("EASY", "MEDIUM", "HARD", "UNKNOWN"):
+                    diff = "UNKNOWN"
+                db_execute(
+                    cur,
+                    _upsert_sql("problem_cache", ["title_slug", "difficulty", "fetched_at"], ["title_slug"]),
+                    (str(slug), diff, int(row.get("fetched_at") or 0)),
+                )
+
         conn.commit()
         conn.close()
 
@@ -1495,6 +1880,7 @@ async def restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
             recompute_leaderboard_from_daily_stats()
 
         _cache.clear()
+        _diff_cache.clear()
 
         await update.message.reply_text(
             "✅ Восстановление завершено!"
@@ -1543,7 +1929,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _cache.pop((nick, today_key, True), None)
 
     # небольшая проверка: сколько уже решено сегодня
-    titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
+    titles, err = await accepted_titles_on_day_async(nick, datetime.now(TZ).date(), deep_check=True)
     if err:
         await update.message.reply_text(
             f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
@@ -1655,7 +2041,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ты не зарегистрирован. Используй /register <nick> 👀")
         return
 
-    titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
+    titles, err = await accepted_titles_on_day_async(nick, datetime.now(TZ).date(), deep_check=True)
     today = datetime.now(TZ).strftime("%Y-%m-%d")
 
     if err:
@@ -1734,13 +2120,25 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не нашёл пользователя. Используй /list @username или /list <leetcode_nick>.")
             return
 
-        titles, err = accepted_titles_on_day(nick, datetime.now(TZ).date(), deep_check=True)
-        today = datetime.now(TZ).strftime("%Y-%m-%d")
+        today_date = datetime.now(TZ).date()
+        today = today_date.strftime("%Y-%m-%d")
         if not target.startswith("@"):
             for _tid, uname, lnick in rows:
                 if str(lnick).lower() == str(nick).lower():
                     display = profile_label(uname)
+                    target_tid = int(_tid)
                     break
+        if target_tid is not None:
+            titles, err, from_snapshot = await get_titles_for_user_on_day(
+                int(target_tid),
+                nick,
+                today_date,
+                deep_check=True,
+                prefer_snapshot=True,
+            )
+        else:
+            titles, err = await accepted_titles_on_day_async(nick, today_date, deep_check=True)
+            from_snapshot = False
         if err:
             await update.message.reply_text(
                 f"⚠️ Ошибка при проверке {display}: {html_text(err)}",
@@ -1750,7 +2148,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Live points update when target is a registered Telegram user
-        if target_tid is not None:
+        if target_tid is not None and not from_snapshot:
             try:
                 titles = update_snapshot_and_leaderboard(today, int(target_tid), len(titles or []), titles or [])
             except Exception:
@@ -1774,29 +2172,35 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
     header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
 
+    today_date = datetime.now(TZ).date()
+    needs_background_refresh = False
     scored = []  # (cnt, sort_name, line, had_error)
-    for tid, uname, nick in rows:
-        titles, err = accepted_titles_today(nick)
-        if err:
-            name = profile_label(uname)
-            scored.append((-1, (uname or "").lower(), f"{name} — ❓ ошибка проверки", True))
+    for tid, uname, _nick in rows:
+        snapshot = get_daily_snapshot(today_str, int(tid), max_age_seconds=None)
+        name = profile_label(uname)
+        sort_name = (uname or "").lower()
+
+        if snapshot is None:
+            needs_background_refresh = True
+            scored.append((0, sort_name, f"{name} — обновляется ⏳", False))
             continue
 
-        cnt = len(titles or [])
-        try:
-            titles = update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles or [])
-            cnt = len(titles or [])
-        except Exception:
-            pass
+        if not _snapshot_is_fresh(snapshot):
+            needs_background_refresh = True
+
+        cnt = len(snapshot["titles"] or [])
         mark = "✅" if cnt >= 1 else "❌"
-        name = profile_label(uname)
-        scored.append((cnt, (uname or "").lower(), f"{name} — {cnt} задач {mark}", False))
+        scored.append((cnt, sort_name, f"{name} — {cnt} задач {mark}", False))
 
     # Sort: more solved -> top; zeros -> bottom; errors -> very bottom
     scored.sort(key=lambda x: (x[3], -x[0], x[1].lower()))
 
     lines = [line for _, __, line, ___ in scored]
-    await update.message.reply_text(header + "\n" + "\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    text = header + "\n" + "\n".join(lines)
+    if needs_background_refresh:
+        if schedule_day_snapshot_refresh(context, rows, today_date, "list"):
+            text += "\n\n⏳ Обновляю данные LeetCode в фоне. Повтори /list через 30-60 сек."
+    await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1807,11 +2211,20 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
+    today_date = datetime.now(TZ).date()
+    checks = await asyncio.gather(
+        *[
+            get_titles_for_user_on_day(int(tid), nick, today_date, prefer_snapshot=True)
+            for tid, _uname, nick in rows
+        ]
+    )
+
     errors = []
-    for tid, uname, nick in rows:
-        titles, err = accepted_titles_today(nick)
+    for (tid, uname, nick), (titles, err, from_snapshot) in zip(rows, checks):
         if err:
             errors.append(profile_label(uname))
+            continue
+        if from_snapshot:
             continue
         try:
             update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
@@ -1861,7 +2274,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = profile_label(uname)
         sort_name = (uname or "").lower()
         is_target = mention(uname).lower() == target
-        titles, err = accepted_titles_on_day(nick, day, deep_check=is_target)
+        titles, err = await accepted_titles_on_day_async(nick, day, deep_check=is_target)
         if err:
             items.append((True, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
             continue
@@ -2228,7 +2641,7 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     errors = []
 
     for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, target_day)
+        titles, err = await accepted_titles_on_day_async(nick, target_day)
         if err:
             errors.append(profile_label(uname))
             continue
@@ -2264,7 +2677,7 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Refresh snapshots for the current week so /week does not depend only on daily reports.
     for day_obj, day_str in zip(dates, days):
         for tid, _uname, nick in rows:
-            titles, err = accepted_titles_on_day(nick, day_obj)
+            titles, err = await accepted_titles_on_day_async(nick, day_obj)
             if err:
                 continue
             try:
@@ -2343,10 +2756,15 @@ async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
 
     today = datetime.now(TZ).date()
     today_str = today.strftime("%Y-%m-%d")
+    checks = await asyncio.gather(
+        *[
+            get_titles_for_user_on_day(int(tid), nick, today, prefer_snapshot=True)
+            for tid, _uname, nick in rows
+        ]
+    )
     scored = []
 
-    for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, today)
+    for (tid, uname, nick), (titles, err, from_snapshot) in zip(rows, checks):
         name = profile_label(uname)
         sort_name = (uname or "").lower()
 
@@ -2357,8 +2775,9 @@ async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
         titles = titles or []
         cnt = len(titles)
         try:
-            titles = update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles)
-            cnt = len(titles)
+            if not from_snapshot:
+                titles = update_snapshot_and_leaderboard(today_str, int(tid), cnt, titles)
+                cnt = len(titles)
         except Exception:
             pass
 
@@ -2391,14 +2810,20 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
     today = datetime.now(TZ).date()
     today_str = today.strftime("%Y-%m-%d")
+    checks = await asyncio.gather(
+        *[
+            get_titles_for_user_on_day(int(tid), nick, today, prefer_snapshot=True)
+            for tid, _uname, nick in rows
+        ]
+    )
 
     not_done = []
-    for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, today)
+    for (tid, uname, nick), (titles, err, from_snapshot) in zip(rows, checks):
         if err:
             continue
         try:
-            titles = update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
+            if not from_snapshot:
+                titles = update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
         except Exception:
             pass
         if not titles:
@@ -2456,9 +2881,11 @@ async def daily_report_job(
     items = []  # (had_error, cnt, profile_name, tagged_name, sort_name, warn_count)
     mvp_max = -1
     mvp_winners: List[str] = []
+    checks = await asyncio.gather(
+        *[accepted_titles_on_day_async(nick, day) for _tid, _uname, nick in rows]
+    )
 
-    for tid, uname, nick in rows:
-        titles, err = accepted_titles_on_day(nick, day)
+    for (tid, uname, nick), (titles, err) in zip(rows, checks):
         name = profile_label(uname)
         sort_name = (uname or "").lower()
         tagged_name = report_mention(int(tid), uname)
