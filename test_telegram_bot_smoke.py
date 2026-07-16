@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+import asyncio
 
 
 class TelegramBotDbSmokeTest(unittest.TestCase):
@@ -106,6 +108,82 @@ class TelegramBotDbSmokeTest(unittest.TestCase):
         self.assertIn("fetched_at", columns)
         self.assertEqual(row[0], 1)
         self.assertTrue(problem_cache_exists)
+
+    def test_bulk_snapshot_and_warning_reads(self):
+        self.bot.add_user(1, "alice", "alice_lc")
+        self.bot.add_user(2, "bob", "bob_lc")
+        today = datetime.now(self.bot.TZ).strftime("%Y-%m-%d")
+
+        self.bot.update_snapshots_and_leaderboard(
+            today,
+            [
+                (1, 1, [self.bot._encode_task_entry("EASY", "Two Sum", "two-sum")]),
+                (2, 1, [self.bot._encode_task_entry("HARD", "N-Queens", "n-queens")]),
+            ],
+        )
+        self.bot.set_warn_count(1, 2)
+
+        snapshots = self.bot.get_daily_snapshots(today, [1, 2])
+        warn_counts = self.bot.get_warn_counts([1, 2])
+
+        self.assertEqual(len(snapshots), 2)
+        self.assertEqual(snapshots[1]["solved_count"], 1)
+        self.assertEqual(snapshots[2]["titles"][0], "HARD N-Queens||n-queens")
+        self.assertEqual(warn_counts, {1: 2})
+
+    def test_group_leetcode_batch_reuses_single_response(self):
+        today = datetime.now(self.bot.TZ).date()
+        timestamp = str(int(datetime.now(self.bot.TZ).timestamp()))
+        calls = []
+
+        original_submissions = self.bot.leetcode_recent_accepted_submissions_batch
+        original_difficulties = self.bot.leetcode_question_difficulties
+        try:
+            def fake_submissions(nicks):
+                calls.append(list(nicks))
+                return {
+                    "alice_lc": [{"title": "Two Sum", "titleSlug": "two-sum", "timestamp": timestamp}],
+                    "bob_lc": [{"title": "N-Queens", "titleSlug": "n-queens", "timestamp": timestamp}],
+                }
+
+            self.bot.leetcode_recent_accepted_submissions_batch = fake_submissions
+            self.bot.leetcode_question_difficulties = lambda slugs: {
+                "two-sum": "EASY",
+                "n-queens": "HARD",
+            }
+
+            result = self.bot.accepted_titles_on_day_batch(["alice_lc", "bob_lc"], today)
+        finally:
+            self.bot.leetcode_recent_accepted_submissions_batch = original_submissions
+            self.bot.leetcode_question_difficulties = original_difficulties
+
+        self.assertEqual(calls, [["alice_lc", "bob_lc"]])
+        self.assertEqual(result["alice_lc"][0], ["EASY Two Sum||two-sum"])
+        self.assertEqual(result["bob_lc"][0], ["HARD N-Queens||n-queens"])
+
+    def test_membership_checks_are_cached_between_commands(self):
+        class FakeBot:
+            def __init__(self):
+                self.calls = []
+
+            async def get_chat_member(self, chat_id, user_id):
+                self.calls.append((chat_id, user_id))
+                return SimpleNamespace(status="member")
+
+        fake_bot = FakeBot()
+        context = SimpleNamespace(bot=fake_bot)
+        rows = [(1, "alice", "alice_lc"), (2, "bob", "bob_lc")]
+        self.bot._membership_cache.clear()
+
+        async def run_checks():
+            first = await self.bot.prune_inactive_users(context, -100, rows, "test")
+            second = await self.bot.prune_inactive_users(context, -100, rows, "test")
+            return first, second
+
+        first, second = asyncio.run(run_checks())
+        self.assertEqual(first, rows)
+        self.assertEqual(second, rows)
+        self.assertEqual(sorted(fake_bot.calls), [(-100, 1), (-100, 2)])
 
 
 if __name__ == "__main__":

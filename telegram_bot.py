@@ -94,12 +94,18 @@ DAILY_MINUTE = int(os.getenv("DAILY_MINUTE", "59"))
 
 EVENING_STATUS_HOUR = 18
 FINAL_REMINDER_HOUR = 23
-CACHE_TTL_SECONDS = 120  # 2 minutes, to avoid repeated API calls spam
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "120"))
 DEEP_CACHE_TTL_SECONDS = 10 * 60
-DAILY_SNAPSHOT_TTL_SECONDS = int(os.getenv("DAILY_SNAPSHOT_TTL_SECONDS", "300"))
-LEETCODE_MAX_CONCURRENCY = max(1, int(os.getenv("LEETCODE_MAX_CONCURRENCY", "4")))
-LEETCODE_HTTP_TIMEOUT = float(os.getenv("LEETCODE_HTTP_TIMEOUT", "15"))
-LEETCODE_RETRY_ATTEMPTS = max(1, int(os.getenv("LEETCODE_RETRY_ATTEMPTS", "3")))
+DAILY_SNAPSHOT_TTL_SECONDS = max(30, int(os.getenv("DAILY_SNAPSHOT_TTL_SECONDS", "120")))
+CURRENT_SNAPSHOT_REFRESH_SECONDS = max(30, int(os.getenv("CURRENT_SNAPSHOT_REFRESH_SECONDS", "60")))
+LEETCODE_MAX_CONCURRENCY = max(1, int(os.getenv("LEETCODE_MAX_CONCURRENCY", "8")))
+LEETCODE_HTTP_TIMEOUT = float(os.getenv("LEETCODE_HTTP_TIMEOUT", "8"))
+LEETCODE_RETRY_ATTEMPTS = max(1, int(os.getenv("LEETCODE_RETRY_ATTEMPTS", "2")))
+LEETCODE_BATCH_SIZE = max(1, int(os.getenv("LEETCODE_BATCH_SIZE", "25")))
+LEETCODE_DIFFICULTY_BATCH_SIZE = max(1, int(os.getenv("LEETCODE_DIFFICULTY_BATCH_SIZE", "40")))
+MEMBERSHIP_CACHE_TTL_SECONDS = max(60, int(os.getenv("MEMBERSHIP_CACHE_TTL_SECONDS", "900")))
+MEMBERSHIP_MAX_CONCURRENCY = max(1, int(os.getenv("MEMBERSHIP_MAX_CONCURRENCY", "12")))
+SEEN_MEMBER_WRITE_TTL_SECONDS = max(60, int(os.getenv("SEEN_MEMBER_WRITE_TTL_SECONDS", "600")))
 PG_POOL_MIN_SIZE = max(0, int(os.getenv("PG_POOL_MIN_SIZE", "1")))
 PG_POOL_MAX_SIZE = max(PG_POOL_MIN_SIZE or 1, int(os.getenv("PG_POOL_MAX_SIZE", "5")))
 CHALLENGE_AUTOMATION_ENABLED = os.getenv("CHALLENGE_AUTOMATION_ENABLED", "0").lower() in ("1", "true", "yes", "on")
@@ -119,7 +125,11 @@ _pg_pool = None
 _leetcode_semaphore: Optional[asyncio.Semaphore] = None
 _leetcode_semaphore_loop = None
 _thread_local = threading.local()
-_background_refreshes: Dict[str, float] = {}
+_leetcode_inflight: Dict[Tuple[str, str, bool], asyncio.Task] = {}
+_leetcode_inflight_loop = None
+_membership_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
+_seen_member_cache: Dict[int, Tuple[Tuple[str, str, bool], float]] = {}
+_problem_cache_write_lock = threading.Lock()
 
 
 # ----------------- DB helpers -----------------
@@ -565,20 +575,50 @@ async def prune_inactive_users(
         return rows
 
     inactive_statuses = _inactive_member_statuses()
+    now_ts = time_module.time()
     active_rows = []
     removed = []
+    statuses: Dict[int, Optional[bool]] = {}
+    rows_to_check = []
 
-    for tid, uname, nick in rows:
+    for tid, _uname, _nick in rows:
+        tid_int = int(tid)
+        cached = _membership_cache.get((int(chat_id), tid_int))
+        if cached and now_ts - cached[1] < MEMBERSHIP_CACHE_TTL_SECONDS:
+            statuses[tid_int] = cached[0]
+        else:
+            rows_to_check.append((tid_int, _uname, _nick))
+
+    semaphore = asyncio.Semaphore(MEMBERSHIP_MAX_CONCURRENCY)
+
+    async def check_membership(tid: int, uname: str) -> Tuple[int, Optional[bool]]:
         try:
-            member = await context.bot.get_chat_member(chat_id=chat_id, user_id=int(tid))
-            if member.status in inactive_statuses:
-                remove_user(int(tid))
-                removed.append(profile_label(uname))
-                logger.info("Pruned inactive user %s (%s), status=%s", uname, tid, member.status)
-            else:
-                active_rows.append((tid, uname, nick))
+            async with semaphore:
+                member = await context.bot.get_chat_member(chat_id=int(chat_id), user_id=tid)
+            is_active = member.status not in inactive_statuses
+            _membership_cache[(int(chat_id), tid)] = (is_active, time_module.time())
+            return tid, is_active
         except Exception as e:
             logger.warning("Could not check group membership for %s (%s): %s", uname, tid, e)
+            return tid, None
+
+    if rows_to_check:
+        checked = await asyncio.gather(
+            *(check_membership(tid, uname) for tid, uname, _nick in rows_to_check)
+        )
+        statuses.update(dict(checked))
+
+    for tid, uname, nick in rows:
+        tid_int = int(tid)
+        is_active = statuses.get(tid_int)
+        if is_active is False:
+            remove_user(tid_int)
+            _membership_cache.pop((int(chat_id), tid_int), None)
+            removed.append(profile_label(uname))
+            logger.info("Pruned inactive user %s (%s)", uname, tid)
+        else:
+            # Keep users when Telegram could not be reached; a failed membership
+            # lookup must never delete a legitimate registration.
             active_rows.append((tid, uname, nick))
 
     if removed:
@@ -605,6 +645,12 @@ def find_user_by_telegram_username(username: str):
 def remember_seen_member(tid: int, username: str, full_name: str, is_bot: bool = False):
     if not tid:
         return
+    member_data = (username or "", full_name or "", bool(is_bot))
+    cached = _seen_member_cache.get(int(tid))
+    now_ts = time_module.time()
+    if cached and cached[0] == member_data and now_ts - cached[1] < SEEN_MEMBER_WRITE_TTL_SECONDS:
+        return
+
     conn = db_connect()
     cur = conn.cursor()
     db_execute(
@@ -614,6 +660,7 @@ def remember_seen_member(tid: int, username: str, full_name: str, is_bot: bool =
     )
     conn.commit()
     conn.close()
+    _seen_member_cache[int(tid)] = (member_data, now_ts)
 
 
 def list_seen_members():
@@ -678,6 +725,50 @@ def get_daily_snapshot(day: str, tid: int, max_age_seconds: Optional[int] = None
         "fetched_at": fetched_at,
     }
 
+
+def get_daily_snapshots(
+    day: str,
+    telegram_ids: List[int],
+    max_age_seconds: Optional[int] = None,
+) -> Dict[int, Dict[str, Any]]:
+    """Load daily snapshots in one query instead of opening a connection per participant."""
+    ids = [int(tid) for tid in dict.fromkeys(telegram_ids)]
+    if not ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in ids)
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        f"SELECT telegram_id, solved_count, titles_json, fetched_at FROM daily_stats "
+        f"WHERE day=? AND telegram_id IN ({placeholders})",
+        (str(day), *ids),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    now_ts = time_module.time()
+    snapshots: Dict[int, Dict[str, Any]] = {}
+    for tid, solved_count, titles_json, fetched_at in rows:
+        fetched_at = int(fetched_at or 0)
+        if max_age_seconds is not None and (
+            not fetched_at or now_ts - fetched_at > max_age_seconds
+        ):
+            continue
+        try:
+            titles = json.loads(titles_json or "[]")
+            if not isinstance(titles, list):
+                titles = []
+        except Exception:
+            titles = []
+        snapshots[int(tid)] = {
+            "solved_count": int(solved_count or len(titles)),
+            "titles": titles,
+            "fetched_at": fetched_at,
+        }
+    return snapshots
+
 def _points_for_difficulty(diff: str) -> int:
     d = (diff or "").strip().upper()
     if d == "EASY":
@@ -740,12 +831,29 @@ def get_leaderboard_points() -> Dict[int, int]:
 
 # ----------------- Warn system helpers -----------------
 def get_warn_count(tid: int) -> int:
+    return get_warn_counts([int(tid)]).get(int(tid), 0)
+
+
+def get_warn_counts(telegram_ids: Optional[List[int]] = None) -> Dict[int, int]:
+    """Read warning counts for all requested users with a single database query."""
     conn = db_connect()
     cur = conn.cursor()
-    db_execute(cur, "SELECT count FROM warns WHERE telegram_id=?", (int(tid),))
-    row = cur.fetchone()
+    if telegram_ids is None:
+        cur.execute("SELECT telegram_id, count FROM warns")
+    else:
+        ids = [int(tid) for tid in dict.fromkeys(telegram_ids)]
+        if not ids:
+            conn.close()
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        db_execute(
+            cur,
+            f"SELECT telegram_id, count FROM warns WHERE telegram_id IN ({placeholders})",
+            tuple(ids),
+        )
+    rows = cur.fetchall()
     conn.close()
-    return int(row[0] or 0) if row else 0
+    return {int(tid): int(count or 0) for tid, count in rows}
 
 
 def set_warn_count(tid: int, count: int):
@@ -1081,6 +1189,87 @@ def update_snapshot_and_leaderboard(day_str: str, tid: int, solved_count: int, t
     return merged_titles
 
 
+def update_snapshots_and_leaderboard(
+    day_str: str,
+    snapshots: List[Tuple[int, int, List[str]]],
+) -> Dict[int, List[str]]:
+    """Persist a group refresh in one transaction and one connection.
+
+    The per-user helper above is kept for command paths that update a single
+    profile. Group refreshes used to open a database connection for every
+    participant, which is particularly costly with Postgres.
+    """
+    normalized = {
+        int(tid): (int(solved_count or 0), list(titles or []))
+        for tid, solved_count, titles in snapshots
+    }
+    if not normalized:
+        return {}
+
+    reset_day = _get_leaderboard_reset_day()
+    count_for_leaderboard = (not reset_day) or (day_str >= reset_day)
+    ids = list(normalized)
+    placeholders = ",".join("?" for _ in ids)
+
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        f"SELECT telegram_id, titles_json FROM daily_stats "
+        f"WHERE day=? AND telegram_id IN ({placeholders})",
+        (str(day_str), *ids),
+    )
+    existing = {int(tid): titles_json for tid, titles_json in cur.fetchall()}
+    merged_by_tid: Dict[int, List[str]] = {}
+
+    for tid, (solved_count, titles) in normalized.items():
+        try:
+            old_titles = json.loads(existing.get(tid) or "[]")
+            if not isinstance(old_titles, list):
+                old_titles = []
+        except Exception:
+            old_titles = []
+
+        merged_titles = _merge_titles(old_titles, titles)
+        merged_by_tid[tid] = merged_titles
+        delta = points_from_titles(merged_titles) - points_from_titles(old_titles)
+
+        if count_for_leaderboard and delta > 0:
+            if USE_POSTGRES:
+                db_execute(
+                    cur,
+                    "INSERT INTO leaderboard(telegram_id, points) VALUES(?, ?) "
+                    "ON CONFLICT(telegram_id) DO UPDATE SET points = leaderboard.points + EXCLUDED.points",
+                    (tid, int(delta)),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO leaderboard(telegram_id, points) VALUES(?, ?) "
+                    "ON CONFLICT(telegram_id) DO UPDATE SET points = points + ?",
+                    (tid, int(delta), int(delta)),
+                )
+
+        db_execute(
+            cur,
+            _upsert_sql(
+                "daily_stats",
+                ["day", "telegram_id", "solved_count", "titles_json", "fetched_at"],
+                ["day", "telegram_id"],
+            ),
+            (
+                str(day_str),
+                tid,
+                max(solved_count, len(merged_titles)),
+                json.dumps(merged_titles, ensure_ascii=False),
+                int(time_module.time()),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+    return merged_by_tid
+
+
 def ensure_daily_report_time_config():
     h_raw = db_get_config("daily_hour")
     m_raw = db_get_config("daily_minute")
@@ -1146,7 +1335,7 @@ def normalize_leetcode_nick(raw: str) -> str:
 
 
 def nick_escape(s: str) -> str:
-    return s.replace('"', '\\"')
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _requests_session() -> requests.Session:
@@ -1163,7 +1352,11 @@ def _requests_session() -> requests.Session:
     return session
 
 
-def leetcode_graphql_request(query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def leetcode_graphql_request(
+    query: str,
+    variables: Optional[Dict[str, Any]] = None,
+    allow_errors: bool = False,
+) -> Dict[str, Any]:
     last_err = None
     payload = {"query": query, "variables": variables or {}}
 
@@ -1176,7 +1369,7 @@ def leetcode_graphql_request(query: str, variables: Optional[Dict[str, Any]] = N
             )
             resp.raise_for_status()
             data = resp.json()
-            if data.get("errors"):
+            if data.get("errors") and not allow_errors:
                 raise RuntimeError(data["errors"])
             return data
         except Exception as e:
@@ -1201,6 +1394,36 @@ def leetcode_recent_accepted_submissions(nick: str):
     """
     data = leetcode_graphql_request(q, {"username": nick, "limit": LEETCODE_RECENT_ACCEPTED_LIMIT})
     return data.get("data", {}).get("recentAcSubmissionList") or []
+
+
+def leetcode_recent_accepted_submissions_batch(nicks: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    """Fetch recent accepted submissions for a group in one GraphQL request."""
+    unique_nicks = list(dict.fromkeys(normalize_leetcode_nick(nick) for nick in nicks if nick))
+    if not unique_nicks:
+        return {}
+
+    fields = []
+    aliases: Dict[str, str] = {}
+    for index, nick in enumerate(unique_nicks):
+        alias = f"user_{index}"
+        aliases[alias] = nick
+        fields.append(
+            f'''{alias}: recentAcSubmissionList(username: "{nick_escape(nick)}", limit: {LEETCODE_RECENT_ACCEPTED_LIMIT}) {{
+                title
+                titleSlug
+                timestamp
+            }}'''
+        )
+
+    data = leetcode_graphql_request(
+        "query recentAcceptedBatch {\n" + "\n".join(fields) + "\n}",
+        allow_errors=True,
+    )
+    payload = data.get("data") or {}
+    return {
+        nick: (payload.get(alias) or [])
+        for alias, nick in aliases.items()
+    }
 
 
 def leetcode_recent_submissions(nick: str):
@@ -1232,8 +1455,12 @@ def leetcode_user_exists(nick: str) -> bool:
     return bool((data.get("data") or {}).get("matchedUser"))
 
 
-def _accepted_titles_from_submissions(subs: List[Dict[str, Any]], target_day: date, require_accepted_status: bool) -> List[str]:
-    titles: List[str] = []
+def _accepted_problem_entries_from_submissions(
+    subs: List[Dict[str, Any]],
+    target_day: date,
+    require_accepted_status: bool,
+) -> List[Tuple[str, Optional[str]]]:
+    problems: List[Tuple[str, Optional[str]]] = []
     seen = set()
 
     for item in subs:
@@ -1261,10 +1488,18 @@ def _accepted_titles_from_submissions(subs: List[Dict[str, Any]], target_day: da
         key = slug or title
         if key not in seen:
             seen.add(key)
-            diff = leetcode_question_difficulty(slug)
-            titles.append(_encode_task_entry(diff, title, slug))
+            problems.append((title, slug))
 
-    return titles
+    return problems
+
+
+def _accepted_titles_from_submissions(subs: List[Dict[str, Any]], target_day: date, require_accepted_status: bool) -> List[str]:
+    problems = _accepted_problem_entries_from_submissions(subs, target_day, require_accepted_status)
+    difficulties = leetcode_question_difficulties([slug for _title, slug in problems if slug])
+    return [
+        _encode_task_entry(difficulties.get(slug or "", "UNKNOWN"), title, slug)
+        for title, slug in problems
+    ]
 
 
 
@@ -1287,6 +1522,35 @@ def get_cached_problem_difficulty(title_slug: str, max_age_seconds: int) -> Opti
     return diff_up if diff_up in ("EASY", "MEDIUM", "HARD") else None
 
 
+def get_cached_problem_difficulties(title_slugs: List[str], max_age_seconds: int) -> Dict[str, str]:
+    slugs = list(dict.fromkeys(slug for slug in title_slugs if slug))
+    if not slugs:
+        return {}
+
+    placeholders = ",".join("?" for _ in slugs)
+    conn = db_connect()
+    cur = conn.cursor()
+    db_execute(
+        cur,
+        f"SELECT title_slug, difficulty, fetched_at FROM problem_cache WHERE title_slug IN ({placeholders})",
+        tuple(slugs),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    now_ts = time_module.time()
+    result: Dict[str, str] = {}
+    for slug, difficulty, fetched_at in rows:
+        diff = str(difficulty or "").upper()
+        if (
+            int(fetched_at or 0)
+            and now_ts - int(fetched_at) <= max_age_seconds
+            and diff in ("EASY", "MEDIUM", "HARD")
+        ):
+            result[str(slug)] = diff
+    return result
+
+
 def set_cached_problem_difficulty(title_slug: str, difficulty: str):
     if not title_slug:
         return
@@ -1294,15 +1558,39 @@ def set_cached_problem_difficulty(title_slug: str, difficulty: str):
     if diff_up not in ("EASY", "MEDIUM", "HARD"):
         diff_up = "UNKNOWN"
 
-    conn = db_connect()
-    cur = conn.cursor()
-    db_execute(
-        cur,
-        _upsert_sql("problem_cache", ["title_slug", "difficulty", "fetched_at"], ["title_slug"]),
-        (title_slug, diff_up, int(time_module.time())),
-    )
-    conn.commit()
-    conn.close()
+    with _problem_cache_write_lock:
+        conn = db_connect()
+        cur = conn.cursor()
+        db_execute(
+            cur,
+            _upsert_sql("problem_cache", ["title_slug", "difficulty", "fetched_at"], ["title_slug"]),
+            (title_slug, diff_up, int(time_module.time())),
+        )
+        conn.commit()
+        conn.close()
+
+
+def set_cached_problem_difficulties(difficulties: Dict[str, str]):
+    rows = []
+    for slug, difficulty in difficulties.items():
+        if not slug:
+            continue
+        diff = str(difficulty or "UNKNOWN").upper()
+        if diff not in ("EASY", "MEDIUM", "HARD"):
+            diff = "UNKNOWN"
+        rows.append((slug, diff, int(time_module.time())))
+    if not rows:
+        return
+
+    with _problem_cache_write_lock:
+        conn = db_connect()
+        cur = conn.cursor()
+        sql = _upsert_sql("problem_cache", ["title_slug", "difficulty", "fetched_at"], ["title_slug"])
+        if USE_POSTGRES:
+            sql = sql.replace("?", "%s")
+        cur.executemany(sql, rows)
+        conn.commit()
+        conn.close()
 
 
 # difficulty cache: titleSlug -> (DIFFICULTY, fetched_at_epoch)
@@ -1314,31 +1602,68 @@ def leetcode_question_difficulty(title_slug: Optional[str]) -> str:
     """Return difficulty for a LeetCode problem by titleSlug (EASY/MEDIUM/HARD)."""
     if not title_slug:
         return "UNKNOWN"
+    return leetcode_question_difficulties([title_slug]).get(title_slug, "UNKNOWN")
 
-    now_ts = datetime.now(TZ).timestamp()
-    cached = _diff_cache.get(title_slug)
-    if cached and (now_ts - cached[1] < _DIFF_CACHE_TTL_SECONDS):
-        return cached[0]
 
-    cached_db = get_cached_problem_difficulty(title_slug, _DIFF_CACHE_TTL_SECONDS)
-    if cached_db:
-        _diff_cache[title_slug] = (cached_db, now_ts)
-        return cached_db
+def leetcode_question_difficulties(title_slugs: List[str]) -> Dict[str, str]:
+    """Resolve question difficulties in GraphQL batches and cache them persistently."""
+    slugs = list(dict.fromkeys(slug for slug in title_slugs if slug))
+    if not slugs:
+        return {}
 
-    q = '{ question(titleSlug: "%s") { difficulty } }' % nick_escape(title_slug)
-    try:
-        data = leetcode_graphql_request(q)
-        diff = (data.get("data", {}).get("question", {}) or {}).get("difficulty") or "UNKNOWN"
-    except Exception as e:
-        logger.exception("LeetCode difficulty fetch error for %s: %s", title_slug, e)
-        diff = "UNKNOWN"
+    now_ts = time_module.time()
+    resolved: Dict[str, str] = {}
+    missing = []
+    for slug in slugs:
+        cached = _diff_cache.get(slug)
+        if cached and now_ts - cached[1] < _DIFF_CACHE_TTL_SECONDS:
+            resolved[slug] = cached[0]
+        else:
+            missing.append(slug)
 
-    diff_up = str(diff).upper()
-    if diff_up not in ("EASY", "MEDIUM", "HARD"):
-        diff_up = "UNKNOWN"
-    _diff_cache[title_slug] = (diff_up, now_ts)
-    set_cached_problem_difficulty(title_slug, diff_up)
-    return diff_up
+    if missing:
+        cached_db = get_cached_problem_difficulties(missing, _DIFF_CACHE_TTL_SECONDS)
+        for slug, difficulty in cached_db.items():
+            _diff_cache[slug] = (difficulty, now_ts)
+            resolved[slug] = difficulty
+        missing = [slug for slug in missing if slug not in cached_db]
+
+    fetched: Dict[str, str] = {}
+    for start in range(0, len(missing), LEETCODE_DIFFICULTY_BATCH_SIZE):
+        batch = missing[start : start + LEETCODE_DIFFICULTY_BATCH_SIZE]
+        aliases = {f"question_{index}": slug for index, slug in enumerate(batch)}
+        fields = [
+            f'{alias}: question(titleSlug: "{nick_escape(slug)}") {{ difficulty }}'
+            for alias, slug in aliases.items()
+        ]
+        try:
+            data = leetcode_graphql_request(
+                "query questionDifficulties {\n" + "\n".join(fields) + "\n}",
+                allow_errors=True,
+            )
+            payload = data.get("data") or {}
+            for alias, slug in aliases.items():
+                difficulty = str((payload.get(alias) or {}).get("difficulty") or "UNKNOWN").upper()
+                fetched[slug] = difficulty if difficulty in ("EASY", "MEDIUM", "HARD") else "UNKNOWN"
+        except Exception as e:
+            logger.warning("LeetCode difficulty batch fetch failed for %s questions: %s", len(batch), e)
+            for slug in batch:
+                try:
+                    q = '{ question(titleSlug: "%s") { difficulty } }' % nick_escape(slug)
+                    data = leetcode_graphql_request(q)
+                    difficulty = str((data.get("data", {}).get("question", {}) or {}).get("difficulty") or "UNKNOWN").upper()
+                    fetched[slug] = difficulty if difficulty in ("EASY", "MEDIUM", "HARD") else "UNKNOWN"
+                except Exception as single_error:
+                    logger.warning("LeetCode difficulty fetch failed for %s: %s", slug, single_error)
+                    fetched[slug] = "UNKNOWN"
+
+    if fetched:
+        for slug, difficulty in fetched.items():
+            _diff_cache[slug] = (difficulty, now_ts)
+            resolved[slug] = difficulty
+        set_cached_problem_difficulties(fetched)
+
+    return {slug: resolved.get(slug, "UNKNOWN") for slug in slugs}
 
 
 def accepted_titles_on_day(nick: str, target_day: date, deep_check: bool = False) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -1384,6 +1709,56 @@ def accepted_titles_on_day(nick: str, target_day: date, deep_check: bool = False
     return titles, None
 
 
+def accepted_titles_on_day_batch(
+    nicks: List[str],
+    target_day: date,
+) -> Dict[str, Tuple[Optional[List[str]], Optional[str]]]:
+    """Fetch normal (non-deep) checks for a group with batched GraphQL queries."""
+    day_key = target_day.strftime("%Y-%m-%d")
+    now_ts = time_module.time()
+    results: Dict[str, Tuple[Optional[List[str]], Optional[str]]] = {}
+    missing = []
+    seen_nicks = set()
+
+    for raw_nick in nicks:
+        nick = normalize_leetcode_nick(raw_nick)
+        if not nick or nick in seen_nicks:
+            continue
+        seen_nicks.add(nick)
+        cached = _cache.get((nick, day_key, False))
+        if cached and now_ts - cached[1] < CACHE_TTL_SECONDS:
+            results[nick] = (cached[0], None)
+        else:
+            missing.append(nick)
+
+    for start in range(0, len(missing), LEETCODE_BATCH_SIZE):
+        batch = missing[start : start + LEETCODE_BATCH_SIZE]
+        try:
+            submissions_by_nick = leetcode_recent_accepted_submissions_batch(batch)
+            problems_by_nick = {
+                nick: _accepted_problem_entries_from_submissions(
+                    submissions_by_nick.get(nick, []), target_day, require_accepted_status=False
+                )
+                for nick in batch
+            }
+            difficulties = leetcode_question_difficulties(
+                [slug for problems in problems_by_nick.values() for _title, slug in problems if slug]
+            )
+            for nick, problems in problems_by_nick.items():
+                titles = [
+                    _encode_task_entry(difficulties.get(slug or "", "UNKNOWN"), title, slug)
+                    for title, slug in problems
+                ]
+                _cache[(nick, day_key, False)] = (titles, now_ts)
+                results[nick] = (titles, None)
+        except Exception as e:
+            logger.warning("LeetCode batch fetch failed for %s users: %s", len(batch), e)
+            for nick in batch:
+                results[nick] = (None, str(e))
+
+    return results
+
+
 def accepted_titles_today(nick: str) -> Tuple[Optional[List[str]], Optional[str]]:
     return accepted_titles_on_day(nick, datetime.now(TZ).date())
 
@@ -1402,8 +1777,38 @@ async def accepted_titles_on_day_async(
     target_day: date,
     deep_check: bool = False,
 ) -> Tuple[Optional[List[str]], Optional[str]]:
+    global _leetcode_inflight_loop
+    loop = asyncio.get_running_loop()
+    if _leetcode_inflight_loop is not loop:
+        _leetcode_inflight.clear()
+        _leetcode_inflight_loop = loop
+
+    normalized_nick = normalize_leetcode_nick(nick)
+    key = (normalized_nick, target_day.strftime("%Y-%m-%d"), bool(deep_check))
+    task = _leetcode_inflight.get(key)
+    if task is None:
+        async def fetch():
+            async with _get_leetcode_semaphore():
+                return await asyncio.to_thread(accepted_titles_on_day, normalized_nick, target_day, deep_check)
+
+        task = loop.create_task(fetch())
+        _leetcode_inflight[key] = task
+
+        def cleanup(done_task):
+            if _leetcode_inflight.get(key) is done_task:
+                _leetcode_inflight.pop(key, None)
+
+        task.add_done_callback(cleanup)
+
+    return await asyncio.shield(task)
+
+
+async def accepted_titles_on_day_batch_async(
+    nicks: List[str],
+    target_day: date,
+) -> Dict[str, Tuple[Optional[List[str]], Optional[str]]]:
     async with _get_leetcode_semaphore():
-        return await asyncio.to_thread(accepted_titles_on_day, nick, target_day, deep_check)
+        return await asyncio.to_thread(accepted_titles_on_day_batch, nicks, target_day)
 
 
 async def accepted_titles_today_async(nick: str) -> Tuple[Optional[List[str]], Optional[str]]:
@@ -1429,69 +1834,34 @@ async def get_titles_for_user_on_day(
     return titles, err, False
 
 
-def _snapshot_is_fresh(snapshot: Optional[Dict[str, Any]]) -> bool:
-    if not snapshot:
-        return False
-    fetched_at = int(snapshot.get("fetched_at") or 0)
-    return bool(fetched_at and (time_module.time() - fetched_at) <= DAILY_SNAPSHOT_TTL_SECONDS)
-
-
-async def refresh_day_snapshots_background(
+async def refresh_day_snapshots(
     rows: List[Tuple[int, str, str]],
     target_day: date,
-    refresh_key: str,
-):
+) -> Tuple[int, int]:
+    """Refresh a set of snapshots with batched LeetCode and database work."""
+    if not rows:
+        return 0, 0
+
     day_str = target_day.strftime("%Y-%m-%d")
-    started = time_module.time()
+    checks = await accepted_titles_on_day_batch_async([nick for _tid, _uname, nick in rows], target_day)
+    successful = []
+    errors = 0
+    for tid, _uname, nick in rows:
+        titles, err = checks.get(normalize_leetcode_nick(nick), (None, "missing result"))
+        if err:
+            errors += 1
+            logger.warning("LeetCode snapshot refresh failed for %s: %s", nick, err)
+            continue
+        successful.append((int(tid), len(titles or []), titles or []))
+
+    if not successful:
+        return 0, errors
     try:
-        checks = await asyncio.gather(
-            *[accepted_titles_on_day_async(nick, target_day) for _tid, _uname, nick in rows],
-            return_exceptions=True,
-        )
-
-        updated = 0
-        errors = 0
-        for (tid, _uname, nick), result in zip(rows, checks):
-            if isinstance(result, Exception):
-                errors += 1
-                logger.warning("Background /list refresh failed for %s: %s", nick, result)
-                continue
-
-            titles, err = result
-            if err:
-                errors += 1
-                logger.warning("Background /list refresh got LeetCode error for %s: %s", nick, err)
-                continue
-
-            try:
-                update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
-                updated += 1
-            except Exception as e:
-                errors += 1
-                logger.warning("Background /list snapshot update failed for %s: %s", nick, e)
-
-        logger.info(
-            "Background /list refresh finished for %s: updated=%s errors=%s elapsed=%.2fs",
-            day_str,
-            updated,
-            errors,
-            time_module.time() - started,
-        )
-    finally:
-        _background_refreshes.pop(refresh_key, None)
-
-
-def schedule_day_snapshot_refresh(context: ContextTypes.DEFAULT_TYPE, rows, target_day: date, reason: str) -> bool:
-    day_str = target_day.strftime("%Y-%m-%d")
-    refresh_key = f"{reason}:{day_str}"
-    now_ts = time_module.time()
-    started_at = _background_refreshes.get(refresh_key)
-    if started_at and (now_ts - started_at) < 120:
-        return False
-
-    _background_refreshes[refresh_key] = now_ts
-    context.application.create_task(refresh_day_snapshots_background(list(rows), target_day, refresh_key))
-    return True
+        update_snapshots_and_leaderboard(day_str, successful)
+    except Exception as e:
+        logger.exception("Snapshot batch update failed for %s: %s", day_str, e)
+        return 0, errors + len(successful)
+    return len(successful), errors
 
 
 def mention(uname: str) -> str:
@@ -1933,7 +2303,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err:
         await update.message.reply_text(
             f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
-            "⚠️ Но LeetCode сейчас не ответил — позже /check покажет всё нормально."
+            "⚠️ LeetCode сейчас не ответил."
         )
         return
 
@@ -1945,8 +2315,7 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark = "✅" if cnt >= 1 else "❌"
     await update.message.reply_text(
         f"🔥 Готово! Ты зарегистрирован как: {nick}\n"
-        f"Сегодня у тебя: {cnt} задач {mark}\n"
-        "Теперь ты в общем списке /list (если вдруг не видно — сделай /list ещё раз через 5–10 сек 😄)"
+        f"Сегодня у тебя: {cnt} задач {mark}"
     )
 
 
@@ -1972,6 +2341,19 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     db_set_config("report_chat_id", str(chat.id))
+    try:
+        job_queue = context.application.job_queue
+        if not job_queue.get_jobs_by_name("current_snapshot_refresh"):
+            job_queue.run_repeating(
+                refresh_current_day_snapshots_job,
+                interval=CURRENT_SNAPSHOT_REFRESH_SECONDS,
+                first=5,
+                name="current_snapshot_refresh",
+            )
+        context.application.create_task(refresh_current_day_snapshots_job(context))
+    except Exception as e:
+        logger.warning("Could not schedule current snapshot refresh: %s", e)
+
     thread_id = getattr(msg, "message_thread_id", None)
     if thread_id is not None:
         db_set_config("report_message_thread_id", str(thread_id))
@@ -2041,35 +2423,23 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ты не зарегистрирован. Используй /register <nick> 👀")
         return
 
-    titles, err = await accepted_titles_on_day_async(nick, datetime.now(TZ).date(), deep_check=True)
+    deep_check = len(context.args) == 1 and not context.args[0].strip().startswith("@")
+    titles, err = await accepted_titles_on_day_async(nick, datetime.now(TZ).date(), deep_check=deep_check)
     today = datetime.now(TZ).strftime("%Y-%m-%d")
 
     if err:
         await update.message.reply_text(f"⚠️ Ошибка при проверке LeetCode: {err}")
         return
 
-    # Live points update for registered Telegram users
+    titles = titles or []
     try:
-        today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         target_tid = None
-        for tid, _, lnick in rows:
-            if str(lnick).lower() == str(nick).lower():
+        for tid, _uname, registered_nick in rows:
+            if normalize_leetcode_nick(registered_nick).lower() == normalize_leetcode_nick(nick).lower():
                 target_tid = int(tid)
                 break
         if target_tid is not None:
-            titles = update_snapshot_and_leaderboard(today_str, int(target_tid), len(titles or []), titles or [])
-    except Exception:
-        pass
-
-    titles = titles or []
-    try:
-        tid_live = None
-        for tid0, _u0, n0 in rows:
-            if str(n0).lower() == str(nick).lower():
-                tid_live = int(tid0)
-                break
-        if tid_live is not None:
-            titles = update_snapshot_and_leaderboard(today, int(tid_live), len(titles), titles)
+            titles = update_snapshot_and_leaderboard(today, target_tid, len(titles), titles)
     except Exception:
         pass
     if not titles:
@@ -2133,7 +2503,7 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 int(target_tid),
                 nick,
                 today_date,
-                deep_check=True,
+                deep_check=False,
                 prefer_snapshot=True,
             )
         else:
@@ -2173,20 +2543,21 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
 
     today_date = datetime.now(TZ).date()
-    needs_background_refresh = False
+    fresh_snapshots = get_daily_snapshots(
+        today_str,
+        [int(tid) for tid, _uname, _nick in rows],
+        max_age_seconds=DAILY_SNAPSHOT_TTL_SECONDS,
+    )
+    stale_rows = [row for row in rows if int(row[0]) not in fresh_snapshots]
+    if stale_rows:
+        await refresh_day_snapshots(stale_rows, today_date)
+    snapshots = get_daily_snapshots(today_str, [int(tid) for tid, _uname, _nick in rows])
+
     scored = []  # (cnt, sort_name, line, had_error)
     for tid, uname, _nick in rows:
-        snapshot = get_daily_snapshot(today_str, int(tid), max_age_seconds=None)
+        snapshot = snapshots.get(int(tid), {"titles": [], "fetched_at": 0})
         name = profile_label(uname)
         sort_name = (uname or "").lower()
-
-        if snapshot is None:
-            needs_background_refresh = True
-            scored.append((0, sort_name, f"{name} — обновляется ⏳", False))
-            continue
-
-        if not _snapshot_is_fresh(snapshot):
-            needs_background_refresh = True
 
         cnt = len(snapshot["titles"] or [])
         mark = "✅" if cnt >= 1 else "❌"
@@ -2197,9 +2568,6 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [line for _, __, line, ___ in scored]
     text = header + "\n" + "\n".join(lines)
-    if needs_background_refresh:
-        if schedule_day_snapshot_refresh(context, rows, today_date, "list"):
-            text += "\n\n⏳ Обновляю данные LeetCode в фоне. Повтори /list через 30-60 сек."
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -2209,27 +2577,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.message.reply_text("Пока нет зарегистрированных. /register <nick>")
         return
-
-    today_str = datetime.now(TZ).strftime("%Y-%m-%d")
-    today_date = datetime.now(TZ).date()
-    checks = await asyncio.gather(
-        *[
-            get_titles_for_user_on_day(int(tid), nick, today_date, prefer_snapshot=True)
-            for tid, _uname, nick in rows
-        ]
-    )
-
-    errors = []
-    for (tid, uname, nick), (titles, err, from_snapshot) in zip(rows, checks):
-        if err:
-            errors.append(profile_label(uname))
-            continue
-        if from_snapshot:
-            continue
-        try:
-            update_snapshot_and_leaderboard(today_str, int(tid), len(titles or []), titles or [])
-        except Exception as e:
-            logger.warning("leaderboard live update failed for %s: %s", nick, e)
 
     points_map = get_leaderboard_points()
     entries = []
@@ -2247,8 +2594,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     header = "🏆 Лидерборд\nEasy = 1 балл, Medium = 3 балла, Hard = 5 баллов\n"
     text = header + "\n".join(lines)
-    if errors:
-        text += "\n\n⚠️ Не смог обновить сейчас: " + ", ".join(errors)
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -2270,18 +2615,30 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     header = f"📋 Сегодняшний статус — {day_str}\n(цель: ≥1 задача)\n"
     items = []
 
-    for tid, uname, nick in rows:
+    checks = await asyncio.gather(
+        *[
+            get_titles_for_user_on_day(
+                int(tid),
+                nick,
+                day,
+                deep_check=mention(uname).lower() == target,
+                prefer_snapshot=True,
+            )
+            for tid, uname, nick in rows
+        ]
+    )
+    for (tid, uname, nick), (titles, err, from_snapshot) in zip(rows, checks):
         name = profile_label(uname)
         sort_name = (uname or "").lower()
         is_target = mention(uname).lower() == target
-        titles, err = await accepted_titles_on_day_async(nick, day, deep_check=is_target)
         if err:
             items.append((True, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
             continue
 
         titles = titles or []
         cnt = len(titles)
-        titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
+        if not from_snapshot:
+            titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
         cnt = len(titles)
         mark = "✅" if cnt >= 1 else "❌"
         items.append((False, cnt, sort_name, f"{name} — {cnt} задач {mark}", titles, is_target))
@@ -2498,7 +2855,13 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Использование: /warns или /warns @username")
             return
         target = context.args[0].strip()
-        found = find_user_by_telegram_username(target) if target.startswith("@") else None
+        found = None
+        if target.startswith("@"):
+            normalized_target = mention(target).lower()
+            for tid, uname, nick in rows:
+                if mention(uname).lower() == normalized_target:
+                    found = (int(tid), uname, nick)
+                    break
         if found is None:
             for tid, uname, nick in rows:
                 if str(nick).lower() == target.lower():
@@ -2508,15 +2871,17 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Не нашёл пользователя в базе.")
             return
         tid, uname, _nick = found
+        warn_count = get_warn_counts([int(tid)]).get(int(tid), 0)
         await update.message.reply_text(
-            f"⚠️ {profile_label(uname)} — {get_warn_count(int(tid))}/3 warnings",
+            f"⚠️ {profile_label(uname)} — {warn_count}/3 warnings",
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
         return
 
+    warn_counts = get_warn_counts([int(tid) for tid, _uname, _nick in rows])
     result = [
-        (get_warn_count(int(tid)), (uname or "").lower(), profile_label(uname))
+        (warn_counts.get(int(tid), 0), (uname or "").lower(), profile_label(uname))
         for tid, uname, _nick in rows
     ]
     result.sort(key=lambda item: (-item[0], item[1]))
@@ -2640,13 +3005,19 @@ async def recheckday(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok = 0
     errors = []
 
-    for tid, uname, nick in rows:
-        titles, err = await accepted_titles_on_day_async(nick, target_day)
+    checks = await asyncio.gather(
+        *[accepted_titles_on_day_async(nick, target_day) for _tid, _uname, nick in rows]
+    )
+    snapshots = []
+    for (tid, uname, _nick), (titles, err) in zip(rows, checks):
         if err:
             errors.append(profile_label(uname))
             continue
-        update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
-        ok += 1
+        snapshots.append((int(tid), len(titles or []), titles or []))
+
+    if snapshots:
+        update_snapshots_and_leaderboard(day_str, snapshots)
+        ok = len(snapshots)
 
     recompute_leaderboard_from_daily_stats()
     _cache.clear()
@@ -2673,17 +3044,6 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     week_start = today - timedelta(days=today.weekday())
     dates = [week_start + timedelta(days=i) for i in range((today - week_start).days + 1)]
     days = [d.strftime("%Y-%m-%d") for d in dates]
-
-    # Refresh snapshots for the current week so /week does not depend only on daily reports.
-    for day_obj, day_str in zip(dates, days):
-        for tid, _uname, nick in rows:
-            titles, err = await accepted_titles_on_day_async(nick, day_obj)
-            if err:
-                continue
-            try:
-                update_snapshot_and_leaderboard(day_str, int(tid), len(titles or []), titles or [])
-            except Exception:
-                pass
 
     week_map = get_week_stats(days)
 
@@ -2740,7 +3100,38 @@ async def week(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(msg_lines), parse_mode="HTML", disable_web_page_preview=True)
 
 
-# ----------------- Jobs: evening status + reminder + daily report -----------------
+# ----------------- Jobs: current snapshots + evening status + reminder + daily report -----------------
+async def refresh_current_day_snapshots_job(context: ContextTypes.DEFAULT_TYPE):
+    """Keep command responses database-only during normal operation."""
+    chat_id_raw = db_get_config("report_chat_id")
+    if not chat_id_raw:
+        return
+
+    chat_id = int(chat_id_raw)
+    rows = await prune_inactive_users(context, chat_id, list_users(), "snapshot_refresh")
+    if not rows:
+        return
+
+    today = datetime.now(TZ).date()
+    today_str = today.strftime("%Y-%m-%d")
+    fresh_snapshots = get_daily_snapshots(
+        today_str,
+        [int(tid) for tid, _uname, _nick in rows],
+        max_age_seconds=DAILY_SNAPSHOT_TTL_SECONDS,
+    )
+    stale_rows = [row for row in rows if int(row[0]) not in fresh_snapshots]
+    if not stale_rows:
+        return
+
+    updated, errors = await refresh_day_snapshots(stale_rows, today)
+    logger.info(
+        "Current snapshot refresh finished for %s: updated=%s errors=%s",
+        today_str,
+        updated,
+        errors,
+    )
+
+
 async def evening_status_job(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Evening status tick at %s", _now_str())
     chat_id_raw = db_get_config("report_chat_id")
@@ -3057,6 +3448,12 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, remember_message_sender))
 
     if CHALLENGE_AUTOMATION_ENABLED or db_get_config("report_chat_id"):
+        app.job_queue.run_repeating(
+            refresh_current_day_snapshots_job,
+            interval=CURRENT_SNAPSHOT_REFRESH_SECONDS,
+            first=5,
+            name="current_snapshot_refresh",
+        )
         app.job_queue.run_daily(
             evening_status_job,
             time=time(hour=EVENING_STATUS_HOUR, minute=0, tzinfo=TZ),
@@ -3076,7 +3473,8 @@ def main():
             name="daily_report",
         )
         logger.info(
-            "Scheduled jobs: evening_status=%02d:00, final_reminder=%02d:00, daily_report=%02d:%02d Asia/Almaty",
+            "Scheduled jobs: snapshots every %ss, evening_status=%02d:00, final_reminder=%02d:00, daily_report=%02d:%02d Asia/Almaty",
+            CURRENT_SNAPSHOT_REFRESH_SECONDS,
             EVENING_STATUS_HOUR,
             FINAL_REMINDER_HOUR,
             h,
