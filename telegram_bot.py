@@ -915,6 +915,70 @@ def clear_all_warns():
     conn.close()
 
 
+# ----------------- Warn pause (temporary, non-destructive) -----------------
+def set_warns_paused_until(value: Optional[str]):
+    if value:
+        db_set_config("warns_paused_until", value)
+    else:
+        db_delete_config("warns_paused_until")
+
+
+def is_warns_paused() -> bool:
+    raw = db_get_config("warns_paused_until")
+    if not raw:
+        return False
+    if raw == "forever":
+        return True
+    try:
+        until = datetime.fromisoformat(raw)
+    except Exception:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=TZ)
+    if datetime.now(TZ) >= until:
+        db_delete_config("warns_paused_until")
+        return False
+    return True
+
+
+def warns_pause_status_text() -> str:
+    raw = db_get_config("warns_paused_until")
+    if not raw:
+        return "▶️ Начисление warn'ов активно (не на паузе)."
+    if raw == "forever":
+        return "⏸ Начисление warn'ов остановлено до команды /resumewarns."
+    try:
+        until = datetime.fromisoformat(raw)
+    except Exception:
+        return "⏸ Начисление warn'ов на паузе."
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=TZ)
+    if datetime.now(TZ) >= until:
+        db_delete_config("warns_paused_until")
+        return "▶️ Начисление warn'ов активно (не на паузе)."
+    return f"⏸ Начисление warn'ов остановлено до {until.strftime('%Y-%m-%d %H:%M')} (Asia/Almaty)."
+
+
+_DURATION_RE = re.compile(r"^(\d+)\s*([mhd])?$", re.IGNORECASE)
+
+
+def parse_duration_to_timedelta(raw: str) -> Optional[timedelta]:
+    m = _DURATION_RE.match((raw or "").strip().lower())
+    if not m:
+        return None
+    amount = int(m.group(1))
+    if amount <= 0:
+        return None
+    unit = m.group(2) or "m"
+    if unit == "m":
+        return timedelta(minutes=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    if unit == "d":
+        return timedelta(days=amount)
+    return None
+
+
 def _backup_dir() -> str:
     custom_dir = os.getenv("BACKUP_DIR", "").strip()
     if custom_dir:
@@ -2893,6 +2957,67 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def pausewarns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /pausewarns [длительность] — admin-only: temporarily stop issuing new warns.
+    Does NOT touch existing warns, leaderboard, or daily stats — only skips
+    awarding new warns while paused. Resume anytime with /resumewarns.
+    """
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    args = context.args or []
+    if not args:
+        set_warns_paused_until("forever")
+        await update.message.reply_text(
+            "⏸ Начисление warn'ов остановлено до команды /resumewarns.\n"
+            "Старые warn'ы, лидерборд и вся статистика не тронуты — просто новые предупреждения выдаваться не будут."
+        )
+        return
+
+    duration = parse_duration_to_timedelta(args[0])
+    if duration is None:
+        await update.message.reply_text(
+            "Использование:\n"
+            "/pausewarns — остановить без срока (до /resumewarns)\n"
+            "/pausewarns 45m — на 45 минут\n"
+            "/pausewarns 3h — на 3 часа\n"
+            "/pausewarns 1d — на 1 день"
+        )
+        return
+
+    until = datetime.now(TZ) + duration
+    set_warns_paused_until(until.isoformat())
+    await update.message.reply_text(
+        f"⏸ Начисление warn'ов остановлено до {until.strftime('%Y-%m-%d %H:%M')} (Asia/Almaty).\n"
+        "Можно вернуть раньше командой /resumewarns.\n"
+        "Старые warn'ы, лидерборд и вся статистика не тронуты."
+    )
+
+
+async def resumewarns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/resumewarns — admin-only: turn warn issuing back on immediately."""
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+
+    was_paused = bool(db_get_config("warns_paused_until"))
+    set_warns_paused_until(None)
+    if was_paused:
+        await update.message.reply_text("▶️ Начисление warn'ов снова включено.")
+    else:
+        await update.message.reply_text("▶️ Warn-система и так была активна (не на паузе).")
+
+
+async def warnstatus_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/warnstatus — for everyone: check whether warn issuing is currently paused."""
+    await maybe_set_group_chat(update)
+    await update.message.reply_text(warns_pause_status_text())
+
+
 async def tagunregistered(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     chat = update.effective_chat
@@ -3267,7 +3392,7 @@ async def daily_report_job(
 
     day = target_day or datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
-    should_apply_warns = apply_warns
+    should_apply_warns = apply_warns and not is_warns_paused()
 
     items = []  # (had_error, cnt, profile_name, tagged_name, sort_name, warn_count)
     mvp_max = -1
@@ -3363,6 +3488,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /week @user — статистика пользователя с понедельника\n"
         "• /warns — предупреждения всех участников\n"
         "• /warns @user — предупреждения одного участника\n"
+        "• /warnstatus — активна ли сейчас выдача warn'ов\n"
         "• /info — эта справка\n\n"
         "*Админ-команды:*\n"
         "• /setgroup — включить авто-отчёты в текущем чате/топике\n"
@@ -3370,7 +3496,9 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /setnick @user <nick> — исправить LeetCode ник участника\n"
         "• /removeuser @user — удалить участника из списка бота\n"
         "• /unwarn @user — сбросить предупреждения одному участнику\n"
-        "• /unwarn all — сбросить предупреждения всем\n\n"
+        "• /unwarn all — сбросить предупреждения всем\n"
+        "• /pausewarns [45m|3h|1d] — временно остановить выдачу warn'ов (без срока — до /resumewarns)\n"
+        "• /resumewarns — снова включить выдачу warn'ов\n\n"
         "*Авто-логика:*\n"
         "📋 В 18:00 бот отправляет общий статус\n"
         "⏰ В 23:00 бот тэгнет тех, кто ещё не решил ни одной задачи\n"
@@ -3440,6 +3568,9 @@ def main():
     app.add_handler(CommandHandler("settime", settime))  # owner-only
     app.add_handler(CommandHandler("warns", warns))
     app.add_handler(CommandHandler("unwarn", unwarn))  # owner-only
+    app.add_handler(CommandHandler("pausewarns", pausewarns_cmd))  # admin-only
+    app.add_handler(CommandHandler("resumewarns", resumewarns_cmd))  # admin-only
+    app.add_handler(CommandHandler("warnstatus", warnstatus_cmd))
     app.add_handler(CommandHandler("tagunregistered", tagunregistered))  # hidden admin-only
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("backup", backup))
