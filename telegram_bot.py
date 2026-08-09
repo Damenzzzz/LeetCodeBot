@@ -2957,6 +2957,20 @@ async def warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def remindnow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remindnow — admin-only: manually trigger the evening reminder right now,
+    pinging everyone who has not solved a problem today yet. Does not touch
+    warns or the daily report — purely a one-off ping.
+    """
+    await maybe_set_group_chat(update)
+    if not await _is_admin(update, context):
+        await update.message.reply_text("⛔ Эта команда только для админа.")
+        return
+    await update.message.reply_text("🔔 Отправляю напоминание...")
+    await evening_status_job(context)
+
+
 async def pausewarns_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /pausewarns [длительность] — admin-only: temporarily stop issuing new warns.
@@ -3571,6 +3585,7 @@ def main():
     app.add_handler(CommandHandler("pausewarns", pausewarns_cmd))  # admin-only
     app.add_handler(CommandHandler("resumewarns", resumewarns_cmd))  # admin-only
     app.add_handler(CommandHandler("warnstatus", warnstatus_cmd))
+    app.add_handler(CommandHandler("remindnow", remindnow_cmd))  # admin-only: manual one-off reminder
     app.add_handler(CommandHandler("tagunregistered", tagunregistered))  # hidden admin-only
     app.add_handler(CommandHandler("info", info))
     app.add_handler(CommandHandler("backup", backup))
