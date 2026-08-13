@@ -161,6 +161,47 @@ class TelegramBotDbSmokeTest(unittest.TestCase):
         self.assertEqual(result["alice_lc"][0], ["EASY Two Sum||two-sum"])
         self.assertEqual(result["bob_lc"][0], ["HARD N-Queens||n-queens"])
 
+    def test_list_ranks_by_points_not_by_task_count(self):
+        """4 Easy (4 points) must rank below 1 Hard (5 points)."""
+        self.bot.add_user(1, "easyguy", "easy_lc")
+        self.bot.add_user(2, "hardguy", "hard_lc")
+        today = datetime.now(self.bot.TZ).strftime("%Y-%m-%d")
+
+        easy_titles = [
+            self.bot._encode_task_entry("EASY", f"Easy Task {i}", f"easy-task-{i}")
+            for i in range(4)
+        ]
+        hard_titles = [self.bot._encode_task_entry("HARD", "N-Queens", "n-queens")]
+        self.bot.update_snapshots_and_leaderboard(
+            today, [(1, len(easy_titles), easy_titles), (2, len(hard_titles), hard_titles)]
+        )
+
+        self.assertEqual(self.bot.points_from_titles(easy_titles), 4)
+        self.assertEqual(self.bot.points_from_titles(hard_titles), 5)
+
+        sent = []
+
+        class FakeMessage:
+            async def reply_text(self, text, **kwargs):
+                sent.append(text)
+
+        update = SimpleNamespace(
+            message=FakeMessage(),
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=1, username="easyguy", full_name="Easy", is_bot=False),
+        )
+        context = SimpleNamespace(args=[], bot=None)
+
+        asyncio.run(self.bot.listcmd(update, context))
+
+        self.assertEqual(len(sent), 1)
+        lines = [ln for ln in sent[0].splitlines() if "балл" in ln and "—" in ln]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("hardguy", lines[0])
+        self.assertIn("5 балл(ов) · 1 задач", lines[0])
+        self.assertIn("easyguy", lines[1])
+        self.assertIn("4 балл(ов) · 4 задач", lines[1])
+
     def test_membership_checks_are_cached_between_commands(self):
         class FakeBot:
             def __init__(self):

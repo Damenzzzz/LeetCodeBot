@@ -5,7 +5,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 - /register <leetcode_nick>   — регистрируешь ник
 - /unregister                 — удаляешься
 - /setgroup                   — (админ) назначить чат для напоминаний/отчётов
-- /list                       — ДЛЯ ВСЕХ: показывает у каждого кол-во решённых задач сегодня + ✅/❌ (решил ≥1 или нет)
+- /list                       — ДЛЯ ВСЕХ: рейтинг за сегодня по баллам (Easy=1, Medium=3, Hard=5) + кол-во решённых задач + ✅/❌
 - /list @user                 — ДЛЯ ВСЕХ: показывает названия задач, решённых этим пользователем сегодня
 - /check                      — ДЛЯ ВСЕХ: показывает твои задачи за сегодня (сколько и какие)
 - /week                       — статистика за последние 7 дней (итоги по каждому)
@@ -15,7 +15,7 @@ LeetCode Group Checker Bot (python-telegram-bot v20)
 Авто-уведомления:
 - в 18:00 и 23:00: пингует тех, кто сегодня ещё не решил ни 1 задачу (с упоминаниями)
 - как только ВСЕ решили ≥1 задачу (проверяется в цикле напоминаний): пишет поздравление 1 раз в день
-- ежедневный отчёт в конце дня: показывает итоговый статус + MVP дня (кто решил больше всех) и сохраняет статистику в БД
+- ежедневный отчёт в конце дня: показывает итоговый статус + MVP дня (кто набрал больше всех баллов за день) и сохраняет статистику в БД
 
 Важно:
 - streak полностью убран
@@ -2337,7 +2337,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /register <nick>\n"
         "• /unregister\n"
         "• /check — твои задачи сегодня\n"
-        "• /list — статус всех сегодня\n"
+        "• /list — статус всех сегодня (баллы + кол-во задач)\n"
         "• /list @user — задачи пользователя сегодня\n"
         "• /leaderboard — рейтинг по баллам (Easy=1, Medium=3, Hard=5)\n"
         "• /week — статистика за 7 дней\n"
@@ -2524,7 +2524,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await maybe_set_group_chat(update)
     """
-    /list — ДЛЯ ВСЕХ: статус всех сегодня (кол-во задач + ✅/❌)
+    /list — ДЛЯ ВСЕХ: статус всех сегодня, отсортированный по баллам (баллы + кол-во задач + ✅/❌)
     /list @user — ДЛЯ ВСЕХ: задачи пользователя сегодня
     """
     rows = await prune_inactive_users(context, membership_chat_id_from_update(update), list_users(), "list")
@@ -2596,15 +2596,19 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        msg = f"{display} — сегодня ({today}) решил {len(titles)} задач ✅:\n" + "\n".join(
-            [f"• {_format_task_entry_html(t)}" for t in titles]
-        )
+        msg = (
+            f"{display} — сегодня ({today}) решил {len(titles)} задач "
+            f"на {points_from_titles(titles)} балл(ов) ✅:\n"
+        ) + "\n".join([f"• {_format_task_entry_html(t)}" for t in titles])
         await update.message.reply_text(msg, parse_mode="HTML", disable_web_page_preview=True)
         return
 
     # /list - summary
     today_str = datetime.now(TZ).strftime("%Y-%m-%d")
-    header = f"📋 Сегодняшний статус — {today_str}\n(цель: ≥1 задача)\n"
+    header = (
+        f"📋 Сегодняшний статус — {today_str}\n"
+        "(цель: ≥1 задача · Easy=1, Medium=3, Hard=5)\n"
+    )
 
     today_date = datetime.now(TZ).date()
     fresh_snapshots = get_daily_snapshots(
@@ -2617,20 +2621,22 @@ async def listcmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await refresh_day_snapshots(stale_rows, today_date)
     snapshots = get_daily_snapshots(today_str, [int(tid) for tid, _uname, _nick in rows])
 
-    scored = []  # (cnt, sort_name, line, had_error)
+    scored = []  # (points, cnt, sort_name, line, had_error)
     for tid, uname, _nick in rows:
         snapshot = snapshots.get(int(tid), {"titles": [], "fetched_at": 0})
         name = profile_label(uname)
         sort_name = (uname or "").lower()
 
-        cnt = len(snapshot["titles"] or [])
+        titles = snapshot["titles"] or []
+        cnt = len(titles)
+        pts = points_from_titles(titles)
         mark = "✅" if cnt >= 1 else "❌"
-        scored.append((cnt, sort_name, f"{name} — {cnt} задач {mark}", False))
+        scored.append((pts, cnt, sort_name, f"{name} — {pts} балл(ов) · {cnt} задач {mark}", False))
 
-    # Sort: more solved -> top; zeros -> bottom; errors -> very bottom
-    scored.sort(key=lambda x: (x[3], -x[0], x[1].lower()))
+    # Sort: more points -> top; ties broken by solved count; zeros -> bottom; errors -> very bottom
+    scored.sort(key=lambda x: (x[4], -x[0], -x[1], x[2]))
 
-    lines = [line for _, __, line, ___ in scored]
+    lines = [line for _pts, _cnt, _sort_name, line, _err in scored]
     text = header + "\n" + "\n".join(lines)
     await update.message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -2676,7 +2682,10 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     day = datetime.now(TZ).date()
     day_str = day.strftime("%Y-%m-%d")
 
-    header = f"📋 Сегодняшний статус — {day_str}\n(цель: ≥1 задача)\n"
+    header = (
+        f"📋 Сегодняшний статус — {day_str}\n"
+        "(цель: ≥1 задача · Easy=1, Medium=3, Hard=5)\n"
+    )
     items = []
 
     checks = await asyncio.gather(
@@ -2696,7 +2705,7 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sort_name = (uname or "").lower()
         is_target = mention(uname).lower() == target
         if err:
-            items.append((True, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
+            items.append((True, -1, -1, sort_name, f"{name} — ❓ ошибка проверки", [], is_target))
             continue
 
         titles = titles or []
@@ -2704,13 +2713,16 @@ async def listtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not from_snapshot:
             titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
         cnt = len(titles)
+        pts = points_from_titles(titles)
         mark = "✅" if cnt >= 1 else "❌"
-        items.append((False, cnt, sort_name, f"{name} — {cnt} задач {mark}", titles, is_target))
+        items.append(
+            (False, pts, cnt, sort_name, f"{name} — {pts} балл(ов) · {cnt} задач {mark}", titles, is_target)
+        )
 
-    items.sort(key=lambda x: (x[0], -x[1], x[2]))
+    items.sort(key=lambda x: (x[0], -x[1], -x[2], x[3]))
 
     lines = []
-    for had_error, _cnt, _sort_name, line, titles, is_target in items:
+    for had_error, _pts, _cnt, _sort_name, line, titles, is_target in items:
         lines.append(line)
         if not had_error and is_target:
             if titles:
@@ -3408,8 +3420,8 @@ async def daily_report_job(
     day_str = day.strftime("%Y-%m-%d")
     should_apply_warns = apply_warns and not is_warns_paused()
 
-    items = []  # (had_error, cnt, profile_name, tagged_name, sort_name, warn_count)
-    mvp_max = -1
+    items = []  # (had_error, points, cnt, profile_name, tagged_name, sort_name, warn_count)
+    mvp_max = -1  # max points of the day
     mvp_winners: List[str] = []
     checks = await asyncio.gather(
         *[accepted_titles_on_day_async(nick, day) for _tid, _uname, nick in rows]
@@ -3421,13 +3433,14 @@ async def daily_report_job(
         tagged_name = report_mention(int(tid), uname)
 
         if err:
-            items.append((True, -1, name, tagged_name, sort_name, None))
+            items.append((True, -1, -1, name, tagged_name, sort_name, None))
             continue
 
         titles = titles or []
         cnt = len(titles)
         titles = update_snapshot_and_leaderboard(day_str, int(tid), cnt, titles)
         cnt = len(titles)
+        pts = points_from_titles(titles)
 
         # Warn system: only if LeetCode check succeeded (no err) and user solved 0 tasks today.
         # For catch-up reports (yesterday), logic is the same. We don't warn on LC errors above.
@@ -3444,18 +3457,19 @@ async def daily_report_job(
                     kicked = True
                 except Exception as e:
                     logger.warning("Kick failed for %s (%s): %s", tagged_name, tid, e)
-        items.append((False, cnt, name, tagged_name, sort_name, warn_count))
+        items.append((False, pts, cnt, name, tagged_name, sort_name, warn_count))
 
-        if cnt > mvp_max:
-            mvp_max = cnt
-            mvp_winners = [tagged_name]
-        elif cnt == mvp_max and cnt > 0:
-            mvp_winners.append(tagged_name)
+        # MVP is decided by points (Easy=1, Medium=3, Hard=5), not by raw task count
+        if pts > mvp_max:
+            mvp_max = pts
+            mvp_winners = [f"{tagged_name} ({cnt} задач)"]
+        elif pts == mvp_max and pts > 0:
+            mvp_winners.append(f"{tagged_name} ({cnt} задач)")
 
-    items.sort(key=lambda x: (x[0], -x[1], x[4]))
+    items.sort(key=lambda x: (x[0], -x[1], -x[2], x[5]))
 
     report_lines = []
-    for had_error, cnt, name, tagged_name, _sort_name, warn_count in items:
+    for had_error, pts, cnt, name, tagged_name, _sort_name, warn_count in items:
         if had_error:
             report_lines.append(f"{name} — ❓ ошибка проверки (LeetCode недоступен)")
         else:
@@ -3464,22 +3478,22 @@ async def daily_report_job(
                 report_name = tagged_name
                 if (not should_apply_warns) or warn_count is None:
                     # fallback: do not show
-                    report_lines.append(f"{report_name} — {cnt} задач {mark}")
+                    report_lines.append(f"{report_name} — {pts} балл(ов) · {cnt} задач {mark}")
                 else:
                     suffix = f" ⚠️ warn {warn_count}/3"
                     if warn_count >= 3:
                         suffix += " ❌ KICK"
-                    report_lines.append(f"{report_name} — {cnt} задач {mark}{suffix}")
+                    report_lines.append(f"{report_name} — {pts} балл(ов) · {cnt} задач {mark}{suffix}")
             else:
-                report_lines.append(f"{name} — {cnt} задач {mark}")
+                report_lines.append(f"{name} — {pts} балл(ов) · {cnt} задач {mark}")
 
     if mvp_max <= 0:
         mvp_line = "🏆 MVP дня: сегодня без победителей… но завтра новый шанс 😄"
     else:
         winners = ", ".join(mvp_winners)
-        mvp_line = f"🏆 MVP дня: {winners} — {mvp_max} задач(и) 🔥"
+        mvp_line = f"🏆 MVP дня: {winners} — {mvp_max} балл(ов) 🔥"
 
-    header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача)\n"
+    header = f"🧾 Итог дня — {day_str}\n(цель: ≥1 задача · Easy=1, Medium=3, Hard=5)\n"
     text = header + "\n".join(report_lines) + "\n\n" + mvp_line
     await send_report_message(context, chat_id, text)
     _set_last_report_day(day_str)
@@ -3495,7 +3509,7 @@ async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /register <nick> — зарегистрировать LeetCode ник\n"
         "• /unregister — удалить себя из бота\n"
         "• /check — сколько и какие задачи *ты* решил сегодня\n"
-        "• /list — статус всех за сегодня (кол-во + ✅/❌)\n"
+        "• /list — статус всех за сегодня: баллы + кол-во задач + ✅/❌ (сортировка по баллам)\n"
         "• /list @user — какие задачи решил пользователь сегодня\n"
         "• /leaderboard или /top — рейтинг: Easy=1, Medium=3, Hard=5\n"
         "• /week — статистика с понедельника\n"
